@@ -466,6 +466,25 @@ pub enum FadeKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DuckingConfig {
+    pub source_track_id: TrackId,
+    pub threshold_db: f32,
+    pub ratio: f32,
+    pub attack_ms: f32,
+    pub release_ms: f32,
+}
+
+impl DuckingConfig {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        self.source_track_id.validate()?;
+        finite_between("track.ducking.threshold_db", self.threshold_db, -60.0, 0.0)?;
+        finite_between("track.ducking.ratio", self.ratio, 1.0, 20.0)?;
+        finite_between("track.ducking.attack_ms", self.attack_ms, 0.01, 2_000.0)?;
+        finite_between("track.ducking.release_ms", self.release_ms, 0.01, 9_000.0)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Effect {
     Brightness {
         value: f32,
@@ -720,6 +739,8 @@ pub struct Track {
     pub name: String,
     pub enabled: bool,
     pub locked: bool,
+    #[serde(default)]
+    pub ducking: Option<DuckingConfig>,
     pub clips: Vec<Clip>,
 }
 
@@ -735,6 +756,7 @@ impl Track {
             name,
             enabled: true,
             locked: false,
+            ducking: None,
             clips: Vec::new(),
         })
     }
@@ -743,6 +765,15 @@ impl Track {
         self.id.validate()?;
         if self.name.trim().is_empty() {
             return Err(invalid("track.name", "must not be empty"));
+        }
+        if let Some(ducking) = &self.ducking {
+            if !matches!(self.kind, TrackKind::Audio) {
+                return Err(invalid(
+                    "track.ducking",
+                    "ducking is only supported on audio tracks",
+                ));
+            }
+            ducking.validate()?;
         }
         let mut seen: Vec<(ClipId, TickRange)> = Vec::new();
         for clip in &self.clips {
@@ -782,6 +813,53 @@ fn track_accepts_asset(track: &TrackKind, asset: &AssetKind) -> bool {
         TrackKind::Audio => matches!(asset, AssetKind::Video | AssetKind::Audio),
         TrackKind::Subtitle => matches!(asset, AssetKind::Subtitle),
     }
+}
+
+fn validate_ducking_references(tracks: &[Track]) -> Result<(), DomainError> {
+    for track in tracks {
+        let Some(ducking) = &track.ducking else {
+            continue;
+        };
+        let source = tracks
+            .iter()
+            .find(|candidate| candidate.id == ducking.source_track_id)
+            .ok_or_else(|| DomainError::NotFound {
+                entity: "track".to_owned(),
+                id: ducking.source_track_id.to_string(),
+            })?;
+        if !matches!(source.kind, TrackKind::Audio) {
+            return Err(invalid(
+                "track.ducking.source_track_id",
+                "source track must be an audio track",
+            ));
+        }
+        if source.id == track.id {
+            return Err(invalid(
+                "track.ducking.source_track_id",
+                "source track must differ from the target track",
+            ));
+        }
+
+        let mut visited = Vec::new();
+        let mut current = track.id.clone();
+        loop {
+            if visited.contains(&current) {
+                return Err(invalid(
+                    "track.ducking",
+                    "ducking references must not form a cycle",
+                ));
+            }
+            visited.push(current.clone());
+            let Some(node) = tracks.iter().find(|candidate| candidate.id == current) else {
+                break;
+            };
+            let Some(next) = node.ducking.as_ref() else {
+                break;
+            };
+            current = next.source_track_id.clone();
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -862,6 +940,7 @@ impl Sequence {
         for track in &self.tracks {
             track.validate(assets)?;
         }
+        validate_ducking_references(&self.tracks)?;
         for marker in &self.markers {
             marker.validate()?;
         }
@@ -1082,6 +1161,10 @@ pub enum TimelineOperation {
         track_id: TrackId,
         enabled: Option<bool>,
         locked: Option<bool>,
+    },
+    SetTrackDucking {
+        track_id: TrackId,
+        ducking: Option<DuckingConfig>,
     },
 }
 
@@ -1557,6 +1640,46 @@ fn apply_operation(
             if let Some(locked) = locked {
                 track.locked = locked;
             }
+        }
+        TimelineOperation::SetTrackDucking { track_id, ducking } => {
+            let target = project
+                .sequence
+                .tracks
+                .iter()
+                .find(|track| track.id == track_id)
+                .ok_or_else(|| DomainError::NotFound {
+                    entity: "track".to_owned(),
+                    id: track_id.to_string(),
+                })?;
+            if target.locked {
+                return Err(DomainError::Locked {
+                    entity: "track".to_owned(),
+                    id: track_id.to_string(),
+                });
+            }
+            if !matches!(target.kind, TrackKind::Audio) {
+                return Err(invalid(
+                    "track.ducking",
+                    "ducking is only supported on audio tracks",
+                ));
+            }
+            if let Some(ducking) = &ducking {
+                ducking.validate()?;
+            }
+            let mut candidate_tracks = project.sequence.tracks.clone();
+            let candidate = candidate_tracks
+                .iter_mut()
+                .find(|track| track.id == track_id)
+                .expect("target track was found above");
+            candidate.ducking = ducking.clone();
+            validate_ducking_references(&candidate_tracks)?;
+            let target = project
+                .sequence
+                .tracks
+                .iter_mut()
+                .find(|track| track.id == track_id)
+                .expect("target track was found above");
+            target.ducking = ducking;
         }
     }
     Ok(())
@@ -2048,6 +2171,74 @@ mod tests {
         assert_eq!(project.sequence.tracks[0].clips[0].timeline_start, 0);
         assert_eq!(project.sequence.tracks[0].clips[1].timeline_start, 30);
         project.validate().unwrap();
+    }
+
+    #[test]
+    fn track_ducking_is_typed_validated_and_backward_compatible() {
+        let (mut project, video_id, _) = project_with_track();
+        let source_id = id(TrackId::new, "voice");
+        let target_id = id(TrackId::new, "music");
+        project
+            .sequence
+            .tracks
+            .push(Track::new(source_id.clone(), TrackKind::Audio, "Voice").unwrap());
+        project
+            .sequence
+            .tracks
+            .push(Track::new(target_id.clone(), TrackKind::Audio, "Music").unwrap());
+
+        let ducking = DuckingConfig {
+            source_track_id: source_id,
+            threshold_db: -24.0,
+            ratio: 4.0,
+            attack_ms: 20.0,
+            release_ms: 250.0,
+        };
+        project
+            .apply_in_place(
+                0,
+                TimelineOperation::SetTrackDucking {
+                    track_id: target_id.clone(),
+                    ducking: Some(ducking.clone()),
+                },
+            )
+            .unwrap();
+        assert_eq!(project.revision, 1);
+        assert_eq!(project.sequence.tracks[2].ducking, Some(ducking));
+
+        let mut old_json = serde_json::to_value(&project).unwrap();
+        for track in old_json["sequence"]["tracks"]
+            .as_array_mut()
+            .expect("tracks are serialized as an array")
+        {
+            track
+                .as_object_mut()
+                .expect("track is serialized as an object")
+                .remove("ducking");
+        }
+        let decoded: ProjectDocument = serde_json::from_value(old_json).unwrap();
+        assert!(decoded
+            .sequence
+            .tracks
+            .iter()
+            .all(|track| track.ducking.is_none()));
+
+        assert!(matches!(
+            project.apply(
+                project.revision,
+                TimelineOperation::SetTrackDucking {
+                    track_id: target_id.clone(),
+                    ducking: Some(DuckingConfig {
+                        source_track_id: video_id,
+                        threshold_db: -24.0,
+                        ratio: 4.0,
+                        attack_ms: 20.0,
+                        release_ms: 250.0,
+                    }),
+                },
+            ),
+            Err(DomainError::InvalidValue { field, .. }) if field == "track.ducking.source_track_id"
+        ));
     }
 
     #[test]

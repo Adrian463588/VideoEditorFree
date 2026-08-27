@@ -23,6 +23,10 @@ is a typed projection over host commands.
   backup/recovery, and path containment checks.
 - Fixed-argv FFmpeg/ffprobe planning, probe validation, cancellation, output
   verification, and atomic export finalization.
+- Layered video/audio export with deterministic sidechain ducking and
+  YouTube, Instagram Reels, and TikTok presets.
+- Local multilingual Whisper subtitle generation with editable timestamped
+  cues when the explicit Subtitle AI bundle is installed.
 - Job registry with snapshots, progress, cancellation, and failure envelopes.
 - Typed local-AI model/readiness and edit-plan contracts; model output cannot
   mutate a project without validation and confirmation.
@@ -48,8 +52,15 @@ npm run verify:bundle
 npm run bundle:download
 ```
 
+Use `npm run bundle:download -- -Profile subtitles` or choose the **Subtitle AI**
+profile beside the **Download bundle** button to install whisper.cpp and the
+multilingual tiny model. The `subtitles` profile is separate from the larger
+`ai` profile. Automatic
+captions transcribe the selected spoken language locally; this is not a cloud
+translation service.
+
 The script defaults to the `all` profile for explicit CLI provisioning and also
-accepts `-Profile core` or `-Profile ai`. Use `npm run bundle:download --
+accepts `-Profile core`, `-Profile subtitles`, or `-Profile ai`. Use `npm run bundle:download --
 -Profile core` for the same profile as the desktop button. No network request is
 made until the user explicitly starts the download. A failed or incomplete
 download never changes capability state to `READY`.

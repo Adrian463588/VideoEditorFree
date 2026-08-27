@@ -708,6 +708,77 @@ pub fn parse_transcript_json(input: &str) -> Result<Transcript, TranscriptError>
     Ok(transcript)
 }
 
+/// Parse the JSON emitted by the official whisper.cpp CLI (`-oj`).
+///
+/// Whisper reports offsets in milliseconds. The AI contract deliberately keeps
+/// those offsets as integer ticks with a documented 1 kHz timebase; the host
+/// converts them to the sequence timebase before storing editable captions.
+pub fn parse_whisper_json(
+    input: &str,
+    language: &str,
+    provenance: ModelProvenance,
+) -> Result<Transcript, TranscriptError> {
+    if language.trim().is_empty() {
+        return Err(TranscriptError::Json("language must not be empty".into()));
+    }
+    let root: Value =
+        serde_json::from_str(input).map_err(|error| TranscriptError::Json(error.to_string()))?;
+    let segments = root
+        .get("transcription")
+        .and_then(Value::as_array)
+        .ok_or_else(|| TranscriptError::Json("whisper JSON missing transcription array".into()))?;
+    if segments.len() > MAX_TRANSCRIPT_CUES {
+        return Err(TranscriptError::ResourceLimit(ResourceLimitExceeded::new(
+            ResourceKind::Cues,
+            MAX_TRANSCRIPT_CUES,
+            segments.len(),
+        )));
+    }
+    let mut cues = Vec::with_capacity(segments.len());
+    for segment in segments {
+        let object = segment
+            .as_object()
+            .ok_or_else(|| TranscriptError::Json("whisper segment must be an object".into()))?;
+        let text = object
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .ok_or(TranscriptError::EmptyCueText)?
+            .to_owned();
+        let offsets = object
+            .get("offsets")
+            .and_then(Value::as_object)
+            .ok_or_else(|| TranscriptError::Json("whisper segment offsets are required".into()))?;
+        let start = parse_whisper_millis(offsets.get("from"))?;
+        let end = parse_whisper_millis(offsets.get("to"))?;
+        cues.push(Cue {
+            range: TickRange::new(start, end).map_err(TranscriptError::InvalidDomain)?,
+            text,
+            confidence: None,
+            speaker: None,
+        });
+    }
+    let transcript = Transcript { provenance, cues };
+    transcript.validate()?;
+    Ok(transcript)
+}
+
+fn parse_whisper_millis(value: Option<&Value>) -> Result<i64, TranscriptError> {
+    let value = value.ok_or_else(|| TranscriptError::Json("whisper offset is required".into()))?;
+    let millis = value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
+        .or_else(|| value.as_str()?.parse::<i64>().ok())
+        .ok_or_else(|| TranscriptError::Json("whisper offset must be an integer".into()))?;
+    if millis < 0 {
+        return Err(TranscriptError::Json(
+            "whisper offset must not be negative".into(),
+        ));
+    }
+    Ok(millis)
+}
+
 fn validate_transcript_shape(value: &Value) -> Result<(), TranscriptError> {
     let object = value
         .as_object()
@@ -1715,6 +1786,23 @@ mod tests {
         ));
         let valid = r#"{"provenance":{"provider":"p","model_id":"m","model_version":"1"},"cues":[{"range":{"start":0,"end":4},"text":"x","confidence":1.0,"speaker":null}]}"#;
         assert!(parse_transcript_json(valid).is_ok());
+    }
+
+    #[test]
+    fn whisper_json_becomes_millisecond_cues() {
+        let json = r#"{"transcription":[{"offsets":{"from":0,"to":1250},"text":" Hello "}]}"#;
+        let transcript = parse_whisper_json(
+            json,
+            "id",
+            ModelProvenance {
+                provider: "whisper.cpp".into(),
+                model_id: "ggml-tiny".into(),
+                model_version: "1.9.0".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(transcript.cues[0].range, TickRange::new(0, 1250).unwrap());
+        assert_eq!(transcript.cues[0].text, "Hello");
     }
 
     #[test]

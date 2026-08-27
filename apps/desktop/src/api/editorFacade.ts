@@ -1,29 +1,42 @@
 import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import type { EditorSnapshot, HostStatus, JobRecord, ProjectDocument } from "../types/editor";
+import type {
+  EditorSnapshot,
+  ExportProfile,
+  HostStatus,
+  JobRecord,
+  ProjectClip,
+  ProjectDocument,
+  ProjectTrack,
+} from "../types/editor";
 import { emptyEditorSnapshot } from "../types/editor";
 
 export type EditorCommand =
-  | { type: "bundleDownload"; profile: "core" | "ai" | "all" }
+  | { type: "bundleDownload"; profile: "core" | "subtitles" | "ai" | "all" }
   | { type: "projectCreate"; name: string }
   | { type: "projectOpenRequested"; projectPath?: string }
   | { type: "projectSave" }
   | { type: "assetImportRequested" }
   | { type: "assetImport"; paths: string[] }
-  | { type: "export"; outputPath: string; baseRevision?: number }
+  | { type: "export"; outputPath: string; profile: ExportProfile; baseRevision?: number }
   | { type: "timelineApply"; baseRevision: number; operation: TimelineOperation }
   | { type: "previewPlay" }
   | { type: "previewPause" }
   | { type: "previewSeek"; timelineTicks: number }
   | { type: "jobCancel"; jobId: string }
+  | { type: "subtitleGenerate"; assetId: string; language: string; baseRevision: number; trackId?: string }
   | { type: "assistantPlan"; baseRevision: number; text: string };
 
 export type TimelineOperation =
+  | { AddTrack: { track: ProjectTrack } }
+  | { AddClip: { track_id: string; clip: ProjectClip } }
+  | { SetTrackState: { track_id: string; enabled?: boolean; locked?: boolean } }
+  | { SetTrackDucking: { track_id: string; ducking: { source_track_id: string; threshold_db: number; ratio: number; attack_ms: number; release_ms: number } | null } }
   | { SplitClip: { clip_id: string; at_timeline_tick: number } }
   | { DeleteClip: { clip_id: string } };
 
 export type EditorCommandResult =
-  | { status: "accepted"; message: string; snapshot?: EditorSnapshot }
+  | { status: "accepted"; message: string; snapshot?: EditorSnapshot; subtitle?: SubtitleGenerationResponse }
   | { status: "BLOCKED" | "UNAVAILABLE"; message: string };
 
 export type EditorEvent =
@@ -33,6 +46,7 @@ export type EditorEvent =
 
 export interface EditorFacade {
   getSnapshot(): Promise<EditorSnapshot>;
+  chooseExportPath(profile: ExportProfile): Promise<string | null>;
   dispatch(command: EditorCommand): Promise<EditorCommandResult>;
   subscribe(listener: (event: EditorEvent) => void): () => void;
 }
@@ -44,9 +58,23 @@ interface SaveProjectResponse { bytesWritten: number; backupCreated: boolean }
 interface TimelineApplyRequest { baseRevision: number; operation: TimelineOperation }
 interface ApplyResult { document: ProjectDocument; undo: { previous: ProjectDocument; applied_revision: number } }
 interface JobRequest { jobId: string }
-interface ExportRequest { outputPath: string; baseRevision?: number }
-interface BundleDownloadRequest { profile: "core" | "ai" | "all" }
+interface ExportRequest { outputPath: string; profile: ExportProfile; baseRevision?: number }
+interface BundleDownloadRequest { profile: "core" | "subtitles" | "ai" | "all" }
 interface BundleDownloadResponse { profile: string; installRoot: string; mediaReady: boolean; message: string }
+interface SubtitleGenerateRequest { assetId: string; language: string; baseRevision: number; trackId?: string }
+export interface SubtitleGenerationResponse {
+  job: JobRecord;
+  document: ProjectDocument;
+  language: string;
+  cueCount: number | null;
+  message: string;
+}
+
+export const exportProfileOptions: ReadonlyArray<{ value: ExportProfile; label: string; defaultName: string }> = [
+  { value: "youtube", label: "YouTube", defaultName: "youtube-export.mp4" },
+  { value: "instagram", label: "Instagram", defaultName: "instagram-export.mp4" },
+  { value: "tiktok", label: "TikTok", defaultName: "tiktok-export.mp4" },
+];
 
 interface CommandSpec {
   bundle_download: { args: BundleDownloadRequest; result: BundleDownloadResponse };
@@ -64,6 +92,7 @@ interface CommandSpec {
   job_list: { args: undefined; result: JobRecord[] };
   export: { args: ExportRequest; result: JobRecord };
   export_start: { args: ExportRequest; result: JobRecord };
+  subtitle_generate: { args: SubtitleGenerateRequest; result: SubtitleGenerationResponse };
   assistant_plan: { args: { baseRevision: number; text: string }; result: void };
 }
 
@@ -78,6 +107,17 @@ const unavailableMessage = "UNAVAILABLE — Tauri host is not running. No projec
 const projectFilters = [{ name: "VideoEditorFree project", extensions: ["vdeproj"] }];
 const mediaFilters = [{ name: "Media", extensions: ["mp4", "mov", "mkv", "webm", "avi", "m4v", "ts", "mts", "m2ts", "3gp", "flv", "wmv", "mpeg", "mpg", "ogv", "wav", "mp3", "m4a", "flac", "ogg", "aac", "opus", "aiff", "aif", "mka", "ac3", "wma", "amr", "png", "jpg", "jpeg", "webp", "bmp", "srt", "vtt"] }];
 const projectPathWithExtension = (path: string) => path.toLowerCase().endsWith(".vdeproj") ? path : `${path}.vdeproj`;
+const exportFilters = [{ name: "MP4 video", extensions: ["mp4"] }];
+const normalizePath = (path: string) => path.replaceAll("\\", "/");
+const directoryOf = (path: string) => normalizePath(path).replace(/\/[^/]*$/, "") || "/";
+const projectRelativePath = (selectedPath: string, projectFile: string) => {
+  const root = directoryOf(projectFile).replace(/\/+$/, "");
+  const normalizedSelected = normalizePath(selectedPath);
+  const prefix = `${root}/`;
+  if (!normalizedSelected.toLocaleLowerCase().startsWith(prefix.toLocaleLowerCase())) return null;
+  const relative = normalizedSelected.slice(prefix.length);
+  return relative && !relative.includes("/../") && relative !== ".." ? relative : null;
+};
 
 const statusSnapshot = (status: HostStatus, project: ProjectDocument | null = null, jobs: JobRecord[] = []): EditorSnapshot => ({
   ...emptyEditorSnapshot,
@@ -86,6 +126,20 @@ const statusSnapshot = (status: HostStatus, project: ProjectDocument | null = nu
   capabilities: {
     mediaRuntime: status.media.state,
     assistant: { id: "local-llm", label: "Local edit assistant", state: status.ai.state, reason: status.ai.reason },
+    subtitles: {
+      id: "local-stt",
+      label: "Local subtitle generation",
+      state: status.subtitles?.state ?? "UNAVAILABLE",
+      reason: status.subtitles?.reason ?? "The host does not expose a verified subtitle generation capability.",
+    },
+    audioDucking: status.audioDucking ?? {
+      state: "UNAVAILABLE",
+      reason: "The host does not expose typed audio ducking.",
+    },
+    exportProfiles: status.exportProfiles ?? {
+      state: "UNAVAILABLE",
+      reason: "The host does not expose platform export profiles.",
+    },
   },
   connection: status.core.state,
   connectionMessage: status.core.reason,
@@ -104,6 +158,7 @@ const commandName = (command: EditorCommand) => ({
   previewPause: "preview_pause",
   previewSeek: "preview_seek",
   jobCancel: "job_cancel",
+  subtitleGenerate: "subtitle_generate",
   assistantPlan: "assistant_plan",
 }[command.type]);
 
@@ -120,7 +175,7 @@ const transportErrorCode = (error: unknown) => {
 };
 
 const isMissingHostCommand = (error: unknown) => /(?:command|invoke).*(?:not found|unknown|unavailable|not allowed)/i.test(transportErrorMessage(error));
-const isUnavailableHostError = (error: unknown) => /(?:UNAVAILABLE|NOT_PROVISIONED|MEDIA_UNAVAILABLE|PREVIEW_UNAVAILABLE|AI_UNAVAILABLE|BUNDLE_DOWNLOAD_FAILED|BUNDLE_SCRIPT_MISSING|BUNDLE_MANIFEST_MISSING)/i.test(transportErrorCode(error))
+const isUnavailableHostError = (error: unknown) => /(?:UNAVAILABLE|NOT_PROVISIONED|MEDIA_UNAVAILABLE|PREVIEW_UNAVAILABLE|AI_UNAVAILABLE|SUBTITLE_RUNTIME_UNAVAILABLE|AI_TRANSCRIPTION_FAILED|AI_TRANSCRIPTION_CANCELLED|BUNDLE_DOWNLOAD_FAILED|BUNDLE_SCRIPT_MISSING|BUNDLE_MANIFEST_MISSING)/i.test(transportErrorCode(error))
   || /(?:not provisioned|no (?:reviewed|verified) .* provisioned|runtime is unavailable)/i.test(transportErrorMessage(error));
 
 const createTauriEditorFacade = (transport: CommandTransport): EditorFacade => {
@@ -139,6 +194,17 @@ const createTauriEditorFacade = (transport: CommandTransport): EditorFacade => {
   };
 
   return {
+    chooseExportPath: async (profile) => {
+      if (!projectPath) return null;
+      const option = exportProfileOptions.find((item) => item.value === profile) ?? exportProfileOptions[0];
+      const selected = await save({
+        title: `Export ${option.label} video`,
+        defaultPath: `${directoryOf(projectPath)}/${option.defaultName}`,
+        filters: exportFilters,
+      });
+      if (typeof selected !== "string" || !selected.trim()) return null;
+      return projectRelativePath(selected.trim(), projectPath);
+    },
     getSnapshot: async () => {
       const hostStatus = await transport("host_status", undefined);
       const jobs = await transport("job_list", undefined);
@@ -217,14 +283,20 @@ const createTauriEditorFacade = (transport: CommandTransport): EditorFacade => {
               const project = await transport("asset_import", { paths: command.paths });
               setProject(project, "Assets imported.");
               return { status: "accepted", message: "Assets imported.", snapshot };
-            }
+          }
           case "export": {
-            const job = await transport("export_start", { outputPath: command.outputPath, baseRevision: command.baseRevision });
+            if (snapshot.capabilities.exportProfiles.state !== "READY") {
+              return { status: "UNAVAILABLE", message: `UNAVAILABLE — ${snapshot.capabilities.exportProfiles.reason}` };
+            }
+            const job = await transport("export_start", { outputPath: command.outputPath, profile: command.profile, baseRevision: command.baseRevision });
             snapshot = { ...snapshot, jobs: [...snapshot.jobs.filter((item) => item.id !== job.id), job] };
             notify({ type: "jobUpdated", job });
             return { status: "accepted", message: "Export job started.", snapshot };
           }
           case "timelineApply": {
+            if ("SetTrackDucking" in command.operation && snapshot.capabilities.audioDucking.state !== "READY") {
+              return { status: "UNAVAILABLE", message: `UNAVAILABLE — ${snapshot.capabilities.audioDucking.reason}` };
+            }
             const result = await transport("timeline_apply", { baseRevision: command.baseRevision, operation: command.operation });
             setProject(result.document, `Timeline updated at revision ${result.document.revision}.`);
             return { status: "accepted", message: snapshot.connectionMessage, snapshot };
@@ -254,10 +326,25 @@ const createTauriEditorFacade = (transport: CommandTransport): EditorFacade => {
               notify({ type: "jobUpdated", job });
             }
             return { status: "accepted", message: `Cancellation requested for job ${command.jobId}.` };
-         case "assistantPlan":
-           await transport("assistant_plan", { baseRevision: command.baseRevision, text: command.text });
-           return { status: "accepted", message: "Assistant plan ready for review." };
-       }
+          case "subtitleGenerate": {
+            if (snapshot.capabilities.subtitles.state !== "READY") {
+              return { status: "UNAVAILABLE", message: `UNAVAILABLE — ${snapshot.capabilities.subtitles.reason}` };
+            }
+            const result = await transport("subtitle_generate", {
+              assetId: command.assetId,
+              language: command.language,
+              baseRevision: command.baseRevision,
+              trackId: command.trackId,
+            });
+            setProject(result.document, `Subtitles generated at revision ${result.document.revision}.`);
+            snapshot = { ...snapshot, jobs: [...snapshot.jobs.filter((item) => item.id !== result.job.id), result.job] };
+            notify({ type: "jobUpdated", job: result.job });
+            return { status: "accepted", message: result.message, snapshot, subtitle: result };
+          }
+          case "assistantPlan":
+            await transport("assistant_plan", { baseRevision: command.baseRevision, text: command.text });
+            return { status: "accepted", message: "Assistant plan ready for review." };
+        }
       } catch (error) {
         if (isUnavailableHostError(error)) {
           return { status: "UNAVAILABLE", message: "UNAVAILABLE — " + transportErrorMessage(error) };
@@ -277,6 +364,7 @@ const createTauriEditorFacade = (transport: CommandTransport): EditorFacade => {
 
 export const createUnavailableEditorFacade = (): EditorFacade => ({
   getSnapshot: async () => ({ ...emptyEditorSnapshot, connection: "UNAVAILABLE", connectionMessage: unavailableMessage }),
+  chooseExportPath: async () => null,
   dispatch: async () => ({ status: "UNAVAILABLE", message: unavailableMessage }),
   subscribe: () => () => undefined,
 });

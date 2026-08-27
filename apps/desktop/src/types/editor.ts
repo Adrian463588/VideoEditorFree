@@ -3,6 +3,7 @@ export type CapabilityState = "READY" | "BLOCKED" | "UNAVAILABLE";
 export type AssetKind = "Video" | "Audio" | "Image" | "Subtitle";
 export type AssetStatus = "Available" | "Missing" | "Unsupported" | "Invalid";
 export type TrackKind = "Video" | "Audio" | "Subtitle";
+export type ExportProfile = "youtube" | "instagram" | "tiktok";
 
 export interface Rational {
   numerator: number;
@@ -98,6 +99,15 @@ export interface ProjectTrack {
   enabled: boolean;
   locked: boolean;
   clips: ProjectClip[];
+  ducking?: TrackDucking | null;
+}
+
+export interface TrackDucking {
+  source_track_id: string;
+  threshold_db: number;
+  ratio: number;
+  attack_ms: number;
+  release_ms: number;
 }
 
 export interface ProjectDocument {
@@ -154,6 +164,9 @@ export interface EditorSnapshot {
   capabilities: {
     mediaRuntime: CapabilityState;
     assistant: ModelCapability;
+    subtitles: ModelCapability;
+    audioDucking: HostCapabilityStatus;
+    exportProfiles: HostCapabilityStatus;
   };
   connection: CapabilityState;
   connectionMessage: string;
@@ -168,6 +181,9 @@ export interface HostStatus {
   core: HostCapabilityStatus;
   media: HostCapabilityStatus;
   ai: HostCapabilityStatus;
+  subtitles?: HostCapabilityStatus;
+  audioDucking?: HostCapabilityStatus;
+  exportProfiles?: HostCapabilityStatus;
   projectLoaded: boolean;
 }
 
@@ -181,6 +197,20 @@ export const emptyEditorSnapshot: EditorSnapshot = {
       label: "Local edit assistant",
       state: "UNAVAILABLE",
       reason: "No verified local LLM runtime or model is provisioned.",
+    },
+    subtitles: {
+      id: "local-stt",
+      label: "Local subtitle generation",
+      state: "UNAVAILABLE",
+      reason: "The host does not expose a verified subtitle generation capability.",
+    },
+    audioDucking: {
+      state: "UNAVAILABLE",
+      reason: "The host does not expose typed audio ducking.",
+    },
+    exportProfiles: {
+      state: "UNAVAILABLE",
+      reason: "The host does not expose platform export profiles.",
     },
   },
   connection: "UNAVAILABLE",

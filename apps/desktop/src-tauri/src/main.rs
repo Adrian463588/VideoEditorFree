@@ -1,12 +1,17 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use editor_ai::{parse_whisper_json, ModelProvenance};
 use editor_app::{ConfiguredMediaPort, EditorApplication, ProjectPort};
 use editor_domain::{
-    ApplyResult, Asset, AssetId, AssetKind, AssetStatus, AudioStream, DomainError, Fingerprint,
-    ProbeSummary, ProjectDocument, ProjectId, RelativePath, TimelineOperation, VideoStream,
+    ApplyResult, Asset, AssetId, AssetKind, AssetStatus, AudioStream, Clip, ClipId, DomainError,
+    Fingerprint, ProbeSummary, ProjectDocument, ProjectId, Rational, RelativePath,
+    TimelineOperation, Track, TrackId, TrackKind, Transform, VideoStream,
 };
 use editor_jobs::{AppError, JobId, JobKind, JobRecord};
-use editor_media::{BinaryContract, BinaryManifest, ExecutableConfig, ProbeMetadata};
+use editor_media::{
+    BinaryContract, BinaryManifest, ChildProcessRunner, ExecutableConfig, ProbeMetadata,
+    SystemChildProcessRunner,
+};
 use editor_project::{load_project, save_project, save_project_if_revision, validate_project_path};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -14,12 +19,16 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex, OnceLock},
-    time::UNIX_EPOCH,
+    time::{Duration, UNIX_EPOCH},
 };
 use tauri::{path::BaseDirectory, AppHandle, Manager, State};
 
 const MAX_PATH_INPUT_BYTES: usize = 32 * 1024;
 const MAX_IMPORT_PATHS: usize = 256;
+const STT_LANGUAGES: &[&str] = &[
+    "auto", "en", "id", "es", "fr", "de", "it", "pt", "ja", "ko", "zh", "ru", "ar", "hi", "nl",
+    "tr", "pl", "uk", "vi",
+];
 type Application = EditorApplication<SharedProjectPort, ConfiguredMediaPort>;
 
 #[derive(Clone)]
@@ -63,6 +72,9 @@ struct HostStatus {
     core: CapabilityStatus,
     media: CapabilityStatus,
     ai: CapabilityStatus,
+    subtitles: CapabilityStatus,
+    audio_ducking: CapabilityStatus,
+    export_profiles: CapabilityStatus,
     project_loaded: bool,
 }
 #[derive(Clone, Debug, Serialize)]
@@ -84,6 +96,11 @@ impl HostError {
     }
     fn unavailable(code: &str, message: &str) -> Self {
         Self::new(code, message)
+    }
+}
+impl From<HostError> for AppError {
+    fn from(error: HostError) -> Self {
+        Self::new(error.code, error.message, error.retryable, error.details)
     }
 }
 impl From<AppError> for HostError {
@@ -179,6 +196,7 @@ struct TimelineApplyRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ExportRequest {
     output_path: String,
+    profile: String,
     base_revision: Option<u64>,
 }
 #[derive(Clone, Debug, Deserialize)]
@@ -202,6 +220,14 @@ struct AssistantPlanRequest {
 struct BundleDownloadRequest {
     profile: Option<String>,
 }
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SubtitleGenerateRequest {
+    asset_id: String,
+    language: String,
+    base_revision: u64,
+    track_id: Option<String>,
+}
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -215,6 +241,15 @@ struct BundleDownloadResponse {
     profile: String,
     install_root: String,
     media_ready: bool,
+    message: String,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SubtitleGenerationResponse {
+    job: JobResponse,
+    document: ProjectDocument,
+    language: String,
+    cue_count: usize,
     message: String,
 }
 #[derive(Clone, Debug, Serialize)]
@@ -310,6 +345,41 @@ fn configured_media_port(root: PathBuf) -> ConfiguredMediaPort {
         media.set_executables(Some(config));
     }
     media
+}
+
+fn subtitle_runtime_paths(root: &Path) -> (PathBuf, PathBuf) {
+    (
+        root.join("ai").join("whisper").join("whisper-cli.exe"),
+        root.join("models").join("ggml-tiny.bin"),
+    )
+}
+
+fn subtitle_runtime_ready(root: &Path) -> bool {
+    let (executable, model) = subtitle_runtime_paths(root);
+    executable.is_file() && model.is_file()
+}
+
+fn configured_media_executables() -> Option<ExecutableConfig> {
+    media_executables_from_environment()
+        .or_else(|| media_executables_from_bundle(&default_bundle_root()))
+}
+
+fn validate_stt_language(language: &str) -> Result<(), HostError> {
+    if !STT_LANGUAGES.contains(&language) {
+        return Err(HostError::new(
+            "INVALID_REQUEST",
+            "The subtitle language is not supported by the bundled Whisper model.",
+        ));
+    }
+    Ok(())
+}
+
+fn finish_subtitle_job_error(jobs: &editor_jobs::JobRegistry, id: JobId, error: &HostError) {
+    if error.code == "AI_TRANSCRIPTION_CANCELLED" {
+        let _ = jobs.mark_cancelled(id);
+    } else {
+        let _ = jobs.mark_failed(id, AppError::from(error.clone()));
+    }
 }
 
 fn bundle_script_path(app: &AppHandle) -> Result<PathBuf, HostError> {
@@ -618,6 +688,299 @@ fn import_asset(host: &HostState, raw_path: &str) -> Result<Asset, HostError> {
         status: AssetStatus::Available,
     })
 }
+
+fn format_srt_timestamp(milliseconds: i64) -> String {
+    let total = milliseconds.max(0);
+    let hours = total / 3_600_000;
+    let minutes = (total / 60_000) % 60;
+    let seconds = (total / 1_000) % 60;
+    let millis = total % 1_000;
+    format!("{hours:02}:{minutes:02}:{seconds:02},{millis:03}")
+}
+
+fn transcript_to_srt(transcript: &editor_ai::Transcript) -> String {
+    transcript
+        .cues
+        .iter()
+        .enumerate()
+        .map(|(index, cue)| {
+            format!(
+                "{}\n{} --> {}\n{}\n",
+                index + 1,
+                format_srt_timestamp(cue.range.start),
+                format_srt_timestamp(cue.range.end),
+                cue.text
+            )
+        })
+        .collect()
+}
+
+fn milliseconds_to_ticks(milliseconds: i64, timebase: Rational) -> Result<i64, HostError> {
+    if milliseconds <= 0 {
+        return Err(HostError::new(
+            "AI_TRANSCRIPTION_FAILED",
+            "The transcript has no positive duration.",
+        ));
+    }
+    let ticks = (milliseconds as f64 * timebase.numerator as f64
+        / (timebase.denominator as f64 * 1_000.0))
+        .ceil();
+    if !ticks.is_finite() || ticks > i64::MAX as f64 || ticks <= 0.0 {
+        return Err(HostError::new(
+            "AI_TRANSCRIPTION_FAILED",
+            "The transcript duration is outside the project timebase range.",
+        ));
+    }
+    Ok(ticks as i64)
+}
+
+fn whisper_transcribe(
+    source: &Path,
+    config: &ExecutableConfig,
+    whisper: &Path,
+    model: &Path,
+    language: &str,
+    job_id: JobId,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<editor_ai::Transcript, HostError> {
+    if !source.is_file() || !whisper.is_file() || !model.is_file() {
+        return Err(HostError::unavailable(
+            "SUBTITLE_RUNTIME_UNAVAILABLE",
+            "The verified whisper.cpp runtime or multilingual model is not provisioned.",
+        ));
+    }
+    let temporary_root = std::env::temp_dir().join(format!(
+        "videoeditorfree-stt-{}-{}",
+        std::process::id(),
+        job_id
+    ));
+    std::fs::create_dir_all(&temporary_root).map_err(|error| {
+        HostError::new(
+            "AI_TRANSCRIPTION_FAILED",
+            &format!("The subtitle temporary directory could not be created: {error}"),
+        )
+    })?;
+    let result = (|| {
+        let wav = temporary_root.join("audio.wav");
+        let output_prefix = temporary_root.join("transcript");
+        let extract_args = vec![
+            "-nostdin".into(),
+            "-y".into(),
+            "-v".into(),
+            "error".into(),
+            "-i".into(),
+            source.to_string_lossy().into(),
+            "-map".into(),
+            "0:a:0".into(),
+            "-vn".into(),
+            "-sn".into(),
+            "-dn".into(),
+            "-ar".into(),
+            "16000".into(),
+            "-ac".into(),
+            "1".into(),
+            "-c:a".into(),
+            "pcm_s16le".into(),
+            "-f".into(),
+            "wav".into(),
+            wav.to_string_lossy().into(),
+        ];
+        let extracted = SystemChildProcessRunner
+            .run(&config.ffmpeg, &extract_args)
+            .map_err(|error| HostError::new("AI_TRANSCRIPTION_FAILED", &error.to_string()))?;
+        if extracted.status_code != Some(0) {
+            return Err(HostError::new(
+                "AI_TRANSCRIPTION_FAILED",
+                "FFmpeg could not extract an audio stream for subtitle generation.",
+            ));
+        }
+        if cancelled() {
+            return Err(HostError::unavailable(
+                "AI_TRANSCRIPTION_CANCELLED",
+                "Subtitle generation was cancelled.",
+            ));
+        }
+        let whisper_args: Vec<String> = vec![
+            "-m".into(),
+            model.to_string_lossy().into(),
+            "-f".into(),
+            wav.to_string_lossy().into(),
+            "-l".into(),
+            language.into(),
+            "-oj".into(),
+            "-np".into(),
+            "-of".into(),
+            output_prefix.to_string_lossy().into(),
+        ];
+        let mut process = Command::new(whisper)
+            .args(&whisper_args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|error| {
+                HostError::new(
+                    "AI_TRANSCRIPTION_FAILED",
+                    &format!("The whisper.cpp process could not start: {error}"),
+                )
+            })?;
+        let status = loop {
+            if cancelled() {
+                let _ = process.kill();
+                let _ = process.wait();
+                return Err(HostError::unavailable(
+                    "AI_TRANSCRIPTION_CANCELLED",
+                    "Subtitle generation was cancelled.",
+                ));
+            }
+            match process.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+                Err(error) => {
+                    let _ = process.kill();
+                    let _ = process.wait();
+                    return Err(HostError::new(
+                        "AI_TRANSCRIPTION_FAILED",
+                        &format!("The whisper.cpp process could not be monitored: {error}"),
+                    ));
+                }
+            }
+        };
+        if !status.success() {
+            return Err(HostError::new(
+                "AI_TRANSCRIPTION_FAILED",
+                "whisper.cpp could not transcribe the selected audio.",
+            ));
+        }
+        let json_path = output_prefix.with_extension("json");
+        let json = std::fs::read_to_string(&json_path).map_err(|error| {
+            HostError::new(
+                "AI_TRANSCRIPTION_FAILED",
+                &format!("whisper.cpp did not produce a transcript JSON file: {error}"),
+            )
+        })?;
+        parse_whisper_json(
+            &json,
+            language,
+            ModelProvenance {
+                provider: "whisper.cpp".into(),
+                model_id: "ggml-tiny".into(),
+                model_version: "v1.9.0".into(),
+            },
+        )
+        .map_err(|error| HostError::new("AI_TRANSCRIPTION_FAILED", &error.to_string()))
+    })();
+    let _ = std::fs::remove_dir_all(&temporary_root);
+    result
+}
+
+fn write_generated_srt(
+    root: &Path,
+    job_id: JobId,
+    language: &str,
+    transcript: &editor_ai::Transcript,
+) -> Result<(RelativePath, Asset), HostError> {
+    let media_root = root.join("media");
+    std::fs::create_dir_all(&media_root).map_err(|error| {
+        HostError::new(
+            "AI_TRANSCRIPTION_FAILED",
+            &format!("The project media directory could not be created: {error}"),
+        )
+    })?;
+    let file_name = generated_subtitle_file_name(job_id, language);
+    let target = media_root.join(&file_name);
+    let temporary = media_root.join(format!(".{file_name}.part"));
+    let content = transcript_to_srt(transcript);
+    std::fs::write(&temporary, content.as_bytes()).map_err(|error| {
+        HostError::new(
+            "AI_TRANSCRIPTION_FAILED",
+            &format!("The generated subtitle file could not be written: {error}"),
+        )
+    })?;
+    if let Err(error) = std::fs::rename(&temporary, &target) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(HostError::new(
+            "AI_TRANSCRIPTION_FAILED",
+            &format!("The generated subtitle file could not be finalized: {error}"),
+        ));
+    }
+    let relative = RelativePath::new(format!("media/{file_name}")).map_err(HostError::from)?;
+    let metadata = std::fs::metadata(&target).map_err(|error| {
+        HostError::new(
+            "AI_TRANSCRIPTION_FAILED",
+            &format!("The generated subtitle metadata is unavailable: {error}"),
+        )
+    })?;
+    let modified_time = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|value| value.as_secs().to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let asset = Asset {
+        id: stable_asset_id(relative.as_str())?,
+        relative_path: relative.clone(),
+        kind: AssetKind::Subtitle,
+        fingerprint: Fingerprint {
+            size_bytes: metadata.len(),
+            modified_time,
+            sha256: None,
+        },
+        probe: None,
+        status: AssetStatus::Available,
+    };
+    Ok((relative, asset))
+}
+
+fn generated_subtitle_file_name(job_id: JobId, language: &str) -> String {
+    format!("auto-subtitles-{job_id}-{language}.srt")
+}
+
+fn cleanup_generated_srt(root: &Path, job_id: JobId, language: &str) {
+    let file_name = generated_subtitle_file_name(job_id, language);
+    let target = root.join("media").join(&file_name);
+    let _ = std::fs::remove_file(target);
+    let _ = std::fs::remove_file(root.join("media").join(format!(".{file_name}.part")));
+}
+
+fn generated_subtitle_track(
+    document: &ProjectDocument,
+    requested_track: Option<&str>,
+    job_id: JobId,
+) -> Result<(TrackId, Option<Track>), HostError> {
+    if let Some(raw_id) = requested_track {
+        let track_id = TrackId::new(raw_id.to_owned()).map_err(HostError::from)?;
+        let track = document
+            .sequence
+            .tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .ok_or_else(|| {
+                HostError::new("ENTITY_NOT_FOUND", "The subtitle track was not found.")
+            })?;
+        if !matches!(track.kind, TrackKind::Subtitle) {
+            return Err(HostError::new(
+                "INVALID_REQUEST",
+                "Subtitle generation requires a subtitle track.",
+            ));
+        }
+        if track.locked {
+            return Err(HostError::new(
+                "TRACK_LOCKED",
+                "The selected subtitle track is locked.",
+            ));
+        }
+        return Ok((track_id, None));
+    }
+    let track_id = TrackId::new(format!("subtitle-layer-{job_id}")).map_err(HostError::from)?;
+    let track = Track::new(
+        track_id.clone(),
+        TrackKind::Subtitle,
+        format!("Subtitles {job_id}"),
+    )
+    .map_err(HostError::from)?;
+    Ok((track_id, Some(track)))
+}
 fn project_path(raw: &str, must_exist: bool) -> Result<PathBuf, HostError> {
     if raw.trim().is_empty() || raw.len() > MAX_PATH_INPUT_BYTES {
         return Err(invalid_request());
@@ -686,7 +1049,7 @@ fn bundle_download(
     state: State<'_, AppState>,
 ) -> Result<BundleDownloadResponse, HostError> {
     let profile = request.profile.unwrap_or_else(|| "all".to_owned());
-    if !matches!(profile.as_str(), "core" | "ai" | "all") {
+    if !matches!(profile.as_str(), "core" | "subtitles" | "ai" | "all") {
         return Err(invalid_request());
     }
     let script = bundle_script_path(&app)?;
@@ -723,6 +1086,7 @@ fn bundle_download(
         ));
     }
     let media_ready = media_executables_from_bundle(&install_root).is_some();
+    let subtitle_ready = subtitle_runtime_ready(&install_root);
     let host = state
         .0
         .lock()
@@ -732,9 +1096,17 @@ fn bundle_download(
             .or_else(|| media_executables_from_bundle(&install_root)),
     );
     let message = if media_ready {
-        "Runtime bundle downloaded and FFmpeg/ffprobe verified."
+        if subtitle_ready {
+            "Runtime bundle downloaded; FFmpeg/ffprobe and subtitle runtime verified."
+        } else {
+            "Runtime bundle downloaded and FFmpeg/ffprobe verified."
+        }
     } else {
-        "Bundle artifacts were verified; media runtime is not part of this profile."
+        if subtitle_ready {
+            "Subtitle AI bundle downloaded and verified."
+        } else {
+            "Bundle artifacts were verified; media runtime is not part of this profile."
+        }
     };
     Ok(BundleDownloadResponse {
         profile,
@@ -769,6 +1141,32 @@ fn host_status(state: State<'_, AppState>) -> HostStatus {
         ai: CapabilityStatus {
             state: "UNAVAILABLE",
             reason: "No verified local AI runtime or model is provisioned.",
+        },
+        subtitles: if subtitle_runtime_ready(&default_bundle_root()) {
+            CapabilityStatus {
+                state: "READY",
+                reason: "The local multilingual Whisper subtitle runtime is available.",
+            }
+        } else {
+            CapabilityStatus {
+                state: "UNAVAILABLE",
+                reason: "Download and verify the Subtitle AI bundle to generate local captions.",
+            }
+        },
+        audio_ducking: CapabilityStatus {
+            state: "READY",
+            reason: "Typed sidechain ducking is available in the timeline and export planner.",
+        },
+        export_profiles: if host.media.is_configured() {
+            CapabilityStatus {
+                state: "READY",
+                reason: "YouTube, Instagram Reels, and TikTok MP4 presets are available.",
+            }
+        } else {
+            CapabilityStatus {
+                state: "UNAVAILABLE",
+                reason: "Download and verify the Core bundle before exporting.",
+            }
         },
         project_loaded: host.shared.current_document().is_ok(),
     }
@@ -922,6 +1320,210 @@ fn asset_import(
     }
     Ok(document)
 }
+
+#[tauri::command]
+fn subtitle_generate(
+    request: SubtitleGenerateRequest,
+    state: State<'_, AppState>,
+) -> Result<SubtitleGenerationResponse, HostError> {
+    validate_stt_language(&request.language)?;
+    if request.asset_id.trim().is_empty() {
+        return Err(invalid_request());
+    }
+    let (shared, jobs, snapshot, source, config, whisper, model, root, handle) = {
+        let host = state
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if host.project_path.is_none() {
+            return Err(HostError::new(
+                "PROJECT_PATH_REQUIRED",
+                "Create or save a project before generating subtitles.",
+            ));
+        }
+        let snapshot = host.app.snapshot().map_err(HostError::from)?;
+        if request.base_revision != snapshot.document.revision {
+            return Err(HostError::from(AppError::revision_conflict(
+                request.base_revision,
+                snapshot.document.revision,
+            )));
+        }
+        let asset = snapshot
+            .document
+            .assets
+            .iter()
+            .find(|asset| asset.id.as_str() == request.asset_id)
+            .ok_or_else(|| {
+                HostError::new(
+                    "ENTITY_NOT_FOUND",
+                    "The selected media asset was not found.",
+                )
+            })?;
+        if !matches!(asset.kind, AssetKind::Audio | AssetKind::Video) {
+            return Err(HostError::new(
+                "INVALID_REQUEST",
+                "Subtitle generation requires a video or audio asset.",
+            ));
+        }
+        let root = project_root(&host)
+            .canonicalize()
+            .map_err(|_| HostError::new("PROJECT_IO_FAILED", "The project root is unavailable."))?;
+        let source = editor_media::resolve_safe_path(&root, asset.relative_path.as_str())
+            .map_err(|error| HostError::new("MEDIA_PATH_INVALID", &error.to_string()))?;
+        let config = configured_media_executables().ok_or_else(|| {
+            HostError::unavailable(
+                "MEDIA_UNAVAILABLE",
+                "No verified FFmpeg/ffprobe runtime is provisioned.",
+            )
+        })?;
+        let (whisper, model) = subtitle_runtime_paths(&default_bundle_root());
+        if !whisper.is_file() || !model.is_file() {
+            return Err(HostError::unavailable(
+                "SUBTITLE_RUNTIME_UNAVAILABLE",
+                "Download and verify the Subtitle AI bundle before generating subtitles.",
+            ));
+        }
+        let handle = host
+            .app
+            .jobs()
+            .submit(JobKind::Stt, snapshot.metadata.clone())
+            .map_err(HostError::from)?;
+        host.app.jobs().start(handle.id).map_err(HostError::from)?;
+        (
+            host.shared.clone(),
+            host.app.jobs().clone(),
+            snapshot,
+            source,
+            config,
+            whisper,
+            model,
+            root,
+            handle,
+        )
+    };
+
+    let transcript = match whisper_transcribe(
+        &source,
+        &config,
+        &whisper,
+        &model,
+        &request.language,
+        handle.id,
+        &|| handle.token.is_cancelled(),
+    ) {
+        Ok(transcript) => transcript,
+        Err(error) => {
+            finish_subtitle_job_error(&jobs, handle.id, &error);
+            return Err(error);
+        }
+    };
+    if handle.token.is_cancelled() {
+        let _ = jobs.mark_cancelled(handle.id);
+        return Err(HostError::unavailable(
+            "AI_TRANSCRIPTION_CANCELLED",
+            "Subtitle generation was cancelled.",
+        ));
+    }
+    let postprocess = (|| -> Result<ProjectDocument, HostError> {
+        if handle.token.is_cancelled() {
+            return Err(HostError::unavailable(
+                "AI_TRANSCRIPTION_CANCELLED",
+                "Subtitle generation was cancelled.",
+            ));
+        }
+        let (_, subtitle_asset) =
+            write_generated_srt(&root, handle.id, &request.language, &transcript)?;
+        let max_end_millis = transcript
+            .cues
+            .iter()
+            .map(|cue| cue.range.end)
+            .max()
+            .ok_or_else(|| {
+                HostError::new(
+                    "AI_TRANSCRIPTION_FAILED",
+                    "Whisper returned no subtitle cues.",
+                )
+            })?;
+        let duration_ticks =
+            milliseconds_to_ticks(max_end_millis, snapshot.document.sequence.timebase)?;
+        let (track_id, new_track) =
+            generated_subtitle_track(&snapshot.document, request.track_id.as_deref(), handle.id)?;
+        let clip = Clip {
+            id: ClipId::new(format!("subtitle-clip-{}", handle.id)).map_err(HostError::from)?,
+            asset_id: subtitle_asset.id.clone(),
+            timeline_start: 0,
+            timeline_duration: duration_ticks,
+            source_start: 0,
+            source_duration: duration_ticks,
+            speed: Rational::new(1, 1).expect("constant rational is valid"),
+            opacity: 1.0,
+            transform: Transform::default(),
+            effects: Vec::new(),
+            keyframes: Vec::new(),
+        };
+        let host = state
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = shared.current_document().map_err(HostError::from)?;
+        if current.revision != snapshot.document.revision {
+            return Err(HostError::from(AppError::revision_conflict(
+                snapshot.document.revision,
+                current.revision,
+            )));
+        }
+        if handle.token.is_cancelled() {
+            return Err(HostError::unavailable(
+                "AI_TRANSCRIPTION_CANCELLED",
+                "Subtitle generation was cancelled.",
+            ));
+        }
+        let mut document = current
+            .apply(
+                current.revision,
+                TimelineOperation::AddAsset {
+                    asset: subtitle_asset,
+                },
+            )
+            .map_err(HostError::from)?
+            .document;
+        if let Some(track) = new_track {
+            document = document
+                .apply(document.revision, TimelineOperation::AddTrack { track })
+                .map_err(HostError::from)?
+                .document;
+        }
+        document = document
+            .apply(
+                document.revision,
+                TimelineOperation::AddClip { track_id, clip },
+            )
+            .map_err(HostError::from)?
+            .document;
+        host.shared.replace(document.clone());
+        Ok(document)
+    })();
+    let document = match postprocess {
+        Ok(document) => document,
+        Err(error) => {
+            cleanup_generated_srt(&root, handle.id, &request.language);
+            finish_subtitle_job_error(&jobs, handle.id, &error);
+            return Err(error);
+        }
+    };
+    let job = jobs
+        .mark_succeeded(handle.id, None)
+        .map(JobResponse::from)
+        .map_err(HostError::from)?;
+    Ok(SubtitleGenerationResponse {
+        job,
+        document,
+        language: request.language,
+        cue_count: transcript.cues.len(),
+        message: "Local subtitles generated and added to a subtitle layer.".into(),
+    })
+}
+
 #[tauri::command]
 fn timeline_apply(
     request: TimelineApplyRequest,
@@ -981,10 +1583,16 @@ fn export_start(
             snapshot.document.revision,
         )));
     }
+    let profile = editor_media::ExportProfile::parse(if request.profile.trim().is_empty() {
+        "baseline"
+    } else {
+        request.profile.trim()
+    })
+    .map_err(|error| HostError::new("INVALID_EXPORT_PROFILE", &error.to_string()))?;
     let output = RelativePath::new(request.output_path).map_err(HostError::from)?;
     let id = host
         .app
-        .start_media_job_async(JobKind::Export, Some(output))
+        .start_media_job_async_with_profile(JobKind::Export, Some(output), profile)
         .map_err(HostError::from)?;
     host.app
         .job(id)
@@ -1080,6 +1688,7 @@ fn main() {
             project_open,
             project_save,
             asset_import,
+            subtitle_generate,
             timeline_apply,
             preview_play,
             preview_pause,
@@ -1167,5 +1776,19 @@ mod tests {
     #[test]
     fn relative_path_rejects_absolute_export() {
         assert!(RelativePath::new(r"C:\out.mp4").is_err());
+    }
+
+    #[test]
+    fn subtitle_timestamps_use_srt_millisecond_format() {
+        assert_eq!(format_srt_timestamp(3_723_045), "01:02:03,045");
+        assert_eq!(format_srt_timestamp(-1), "00:00:00,000");
+    }
+
+    #[test]
+    fn subtitle_duration_converts_from_milliseconds_to_sequence_ticks() {
+        assert_eq!(
+            milliseconds_to_ticks(1_500, Rational::new(30, 1).unwrap()).unwrap(),
+            45
+        );
     }
 }

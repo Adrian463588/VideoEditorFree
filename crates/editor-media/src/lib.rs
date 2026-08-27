@@ -5,7 +5,8 @@
 //! `PATH`, shell command strings, or caller-provided output evidence.
 
 use editor_domain::{
-    AssetKind, AssetStatus, ClipId, DomainError, ProjectDocument, Rational, TrackKind,
+    AssetKind, AssetStatus, Clip, ClipId, DomainError, Effect, FadeKind, ProjectDocument, Rational,
+    TrackKind, Transform,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -451,9 +452,18 @@ pub struct ConcatMuxStep {
     pub argv: Vec<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompositeStep {
+    pub inputs: Vec<PathBuf>,
+    pub output: PathBuf,
+    pub filter_complex: String,
+    pub argv: Vec<String>,
+}
+pub type FilterComplexStep = CompositeStep;
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RenderStep {
     TrimClip(TrimClipStep),
     ConcatMux(ConcatMuxStep),
+    Composite(CompositeStep),
 }
 impl RenderStep {
     pub fn executable<'a>(&self, config: &'a ExecutableConfig) -> &'a Path {
@@ -463,6 +473,7 @@ impl RenderStep {
         match self {
             Self::TrimClip(s) => &s.argv,
             Self::ConcatMux(s) => &s.argv,
+            Self::Composite(s) => &s.argv,
         }
     }
 }
@@ -516,6 +527,213 @@ pub struct RenderPlan {
     pub output: PathBuf,
     pub expected_output: ExpectedOutput,
     pub binary_contract: BinaryContract,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExportProfile {
+    #[default]
+    Baseline,
+    Youtube,
+    Instagram,
+    Tiktok,
+}
+
+impl ExportProfile {
+    pub fn parse(value: &str) -> Result<Self, MediaError> {
+        match value {
+            "baseline" => Ok(Self::Baseline),
+            "youtube" => Ok(Self::Youtube),
+            "instagram" => Ok(Self::Instagram),
+            "tiktok" => Ok(Self::Tiktok),
+            _ => Err(MediaError::InvalidPlan(format!(
+                "unsupported export profile: {value}"
+            ))),
+        }
+    }
+
+    fn dimensions(self, sequence_width: u32, sequence_height: u32) -> (u32, u32) {
+        match self {
+            Self::Baseline | Self::Youtube => (sequence_width, sequence_height),
+            Self::Instagram | Self::Tiktok => (1080, 1920),
+        }
+    }
+
+    fn max_duration_seconds(self) -> Option<f64> {
+        match self {
+            Self::Baseline | Self::Youtube => None,
+            Self::Instagram => Some(900.0),
+            Self::Tiktok => Some(600.0),
+        }
+    }
+
+    fn video_bitrate(self) -> &'static str {
+        match self {
+            Self::Baseline | Self::Youtube => "8M",
+            Self::Instagram => "12M",
+            Self::Tiktok => "10M",
+        }
+    }
+
+    fn audio_bitrate(self) -> &'static str {
+        match self {
+            Self::Baseline | Self::Youtube => "384k",
+            Self::Instagram | Self::Tiktok => "128k",
+        }
+    }
+
+    fn audio_sample_rate(self) -> u32 {
+        48_000
+    }
+
+    fn audio_channels(self) -> u16 {
+        2
+    }
+
+    fn frame_rate(self) -> Rational {
+        Rational {
+            numerator: 30,
+            denominator: 1,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProfileExpectedOutput {
+    pub profile: ExportProfile,
+    pub stream_kinds: Vec<StreamKind>,
+    pub duration_seconds: f64,
+    pub duration_tolerance_seconds: f64,
+    pub width: u32,
+    pub height: u32,
+    pub video_codec: String,
+    pub audio_codec: Option<String>,
+    pub audio_sample_rate: Option<u32>,
+    pub audio_channels: Option<u16>,
+    pub container: String,
+}
+
+impl ProfileExpectedOutput {
+    pub fn validate(&self) -> Result<(), MediaError> {
+        if self.profile == ExportProfile::Baseline {
+            return Err(MediaError::InvalidOutput(
+                "baseline must use the legacy render plan".into(),
+            ));
+        }
+        positive_finite("expected output duration", self.duration_seconds)?;
+        if !self.duration_tolerance_seconds.is_finite() || self.duration_tolerance_seconds < 0.0 {
+            return Err(MediaError::InvalidOutput(
+                "expected duration tolerance must be finite and non-negative".into(),
+            ));
+        }
+        if self.width == 0 || self.height == 0 {
+            return Err(MediaError::InvalidOutput(
+                "expected output dimensions must be positive".into(),
+            ));
+        }
+        let has_audio = match self.stream_kinds.as_slice() {
+            [StreamKind::Video] => false,
+            [StreamKind::Video, StreamKind::Audio] => true,
+            _ => {
+                return Err(MediaError::InvalidOutput(
+                    "profile output must contain video followed by optional audio".into(),
+                ))
+            }
+        };
+        if self.video_codec.trim().is_empty() || self.container.trim().is_empty() {
+            return Err(MediaError::InvalidOutput(
+                "profile output codec and container must not be empty".into(),
+            ));
+        }
+        if has_audio != self.audio_codec.is_some()
+            || has_audio != self.audio_sample_rate.is_some()
+            || has_audio != self.audio_channels.is_some()
+        {
+            return Err(MediaError::InvalidOutput(
+                "profile audio expectation is incomplete".into(),
+            ));
+        }
+        if self.container != "mp4" {
+            return Err(MediaError::InvalidOutput(
+                "profile output container must be mp4".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn matches_probe(&self, probe: &ProbeMetadata) -> Result<(), MediaError> {
+        self.validate()?;
+        if self.stream_kinds != probe.media_stream_kinds() {
+            return Err(MediaError::InvalidOutput(
+                "profile output stream order does not match the expected layout".into(),
+            ));
+        }
+        let duration = probe.duration_seconds.ok_or_else(|| {
+            MediaError::InvalidOutput("profile output duration is missing".into())
+        })?;
+        if (duration - self.duration_seconds).abs() > self.duration_tolerance_seconds {
+            return Err(MediaError::InvalidOutput(
+                "profile output duration is outside expected tolerance".into(),
+            ));
+        }
+        let video = probe
+            .streams
+            .iter()
+            .find(|stream| stream.codec_type == "video")
+            .ok_or_else(|| {
+                MediaError::InvalidOutput("profile output has no video stream".into())
+            })?;
+        if video.width != Some(self.width)
+            || video.height != Some(self.height)
+            || !video
+                .codec_name
+                .as_deref()
+                .is_some_and(|codec| codec.eq_ignore_ascii_case(&self.video_codec))
+        {
+            return Err(MediaError::InvalidOutput(
+                "profile output video codec or dimensions do not match".into(),
+            ));
+        }
+        if let Some(audio_codec) = &self.audio_codec {
+            let audio = probe
+                .streams
+                .iter()
+                .find(|stream| stream.codec_type == "audio")
+                .ok_or_else(|| {
+                    MediaError::InvalidOutput("profile output has no audio stream".into())
+                })?;
+            if !audio
+                .codec_name
+                .as_deref()
+                .is_some_and(|codec| codec.eq_ignore_ascii_case(audio_codec))
+                || audio.sample_rate != self.audio_sample_rate
+                || audio.channels != self.audio_channels
+            {
+                return Err(MediaError::InvalidOutput(
+                    "profile output audio codec or layout does not match".into(),
+                ));
+            }
+        }
+        if !probe.format_name.as_deref().is_some_and(|format| {
+            format
+                .split(',')
+                .any(|candidate| candidate.eq_ignore_ascii_case(&self.container))
+        }) {
+            return Err(MediaError::InvalidOutput(
+                "profile output container does not match".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayeredRenderPlan {
+    pub step: CompositeStep,
+    pub output: PathBuf,
+    pub expected_output: ProfileExpectedOutput,
+    pub binary_contract: BinaryContract,
+    pub profile: ExportProfile,
 }
 
 pub fn build_render_plan(
@@ -717,6 +935,574 @@ pub fn build_render_plan(
         binary_contract: executables.binary_contract.clone(),
     })
 }
+
+#[derive(Clone, Debug)]
+struct VideoLayer {
+    input_index: usize,
+    timeline_start: f64,
+    timeline_end: f64,
+}
+
+#[derive(Clone, Debug)]
+struct AudioLayer {
+    input_index: usize,
+    track_id: String,
+    timeline_start: f64,
+    effects: String,
+}
+
+/// Build one fixed-argv composition for the multi-layer export path.
+///
+/// The graph is generated from typed project values only. Frontend strings
+/// never become filter expressions or command fragments.
+pub fn build_export_plan(
+    document: &ProjectDocument,
+    project_root: &Path,
+    output: impl Into<PathBuf>,
+    executables: &ExecutableConfig,
+    profile: ExportProfile,
+) -> Result<RenderPlan, MediaError> {
+    if profile == ExportProfile::Baseline {
+        return Err(MediaError::Unsupported(
+            "baseline export uses the legacy render plan".into(),
+        ));
+    }
+    document.validate().map_err(MediaError::Domain)?;
+    executables.validate_for_plan()?;
+    let output = validate_output_path(output.into())?;
+    let (width, height) = profile.dimensions(document.sequence.width, document.sequence.height);
+    let frame_rate = format_rational(profile.frame_rate());
+    let mut argv = vec![
+        "-nostdin".into(),
+        "-y".into(),
+        "-f".into(),
+        "lavfi".into(),
+        "-i".into(),
+        format!("color=c=black:s={width}x{height}:r={frame_rate}:d=1"),
+    ];
+    let mut inputs = Vec::new();
+    let mut video_layers = Vec::new();
+    let mut audio_layers = Vec::new();
+    let mut duration = 0.0_f64;
+    let one = Rational::new(1, 1).expect("constant rational is valid");
+
+    for track in document
+        .sequence
+        .tracks
+        .iter()
+        .filter(|track| track.enabled && matches!(track.kind, TrackKind::Video))
+    {
+        for clip in &track.clips {
+            let asset = asset_for_clip(document, clip)?;
+            if !matches!(asset.kind, AssetKind::Video | AssetKind::Image)
+                || !matches!(asset.status, AssetStatus::Available)
+            {
+                return Err(MediaError::InvalidPlan(format!(
+                    "clip {} requires an available video or image asset",
+                    clip.id
+                )));
+            }
+            let probe = asset.probe.as_ref().ok_or_else(|| {
+                MediaError::InvalidPlan(format!("clip {} has no validated probe metadata", clip.id))
+            })?;
+            if probe.video.is_none() {
+                return Err(MediaError::InvalidPlan(format!(
+                    "clip {} has no video stream",
+                    clip.id
+                )));
+            }
+            if clip.speed != one
+                || !clip.effects.is_empty()
+                || !clip.keyframes.is_empty()
+                || clip.opacity != 1.0
+                || clip.transform != Transform::default()
+            {
+                return Err(MediaError::Unsupported(
+                    "layered export currently supports clean video clips; remove unsupported visual effects first".into(),
+                ));
+            }
+            let source_start = ticks_to_seconds(clip.source_start, probe.stream_timebase)?;
+            let source_duration = ticks_to_seconds(clip.source_duration, probe.stream_timebase)?;
+            let timeline_start = ticks_to_seconds(clip.timeline_start, document.sequence.timebase)?;
+            let timeline_duration =
+                ticks_to_seconds(clip.timeline_duration, document.sequence.timebase)?;
+            if (source_duration - timeline_duration).abs() > 0.01 {
+                return Err(MediaError::Unsupported(
+                    "layered export requires clip source and timeline durations to match when speed is 1".into(),
+                ));
+            }
+            let input = resolve_safe_path(project_root, asset.relative_path.as_str())?;
+            if paths_alias(&input, &output) {
+                return Err(MediaError::PathViolation(
+                    "input and output paths must be distinct".into(),
+                ));
+            }
+            let input_index = inputs.len() + 1;
+            inputs.push(input.clone());
+            if matches!(asset.kind, AssetKind::Image) {
+                argv.extend(["-loop".into(), "1".into()]);
+            }
+            argv.extend([
+                "-ss".into(),
+                format_seconds(source_start),
+                "-t".into(),
+                format_seconds(source_duration),
+                "-i".into(),
+                input.to_string_lossy().into(),
+            ]);
+            let timeline_end = timeline_start + timeline_duration;
+            duration = duration.max(timeline_end);
+            video_layers.push(VideoLayer {
+                input_index,
+                timeline_start,
+                timeline_end,
+            });
+            if probe.audio.is_some() {
+                audio_layers.push(AudioLayer {
+                    input_index,
+                    track_id: track.id.to_string(),
+                    timeline_start,
+                    effects: String::new(),
+                });
+            }
+        }
+    }
+
+    for track in document
+        .sequence
+        .tracks
+        .iter()
+        .filter(|track| track.enabled && matches!(track.kind, TrackKind::Audio))
+    {
+        for clip in &track.clips {
+            let asset = asset_for_clip(document, clip)?;
+            if !matches!(asset.kind, AssetKind::Video | AssetKind::Audio)
+                || !matches!(asset.status, AssetStatus::Available)
+            {
+                return Err(MediaError::InvalidPlan(format!(
+                    "clip {} requires an available audio or video asset",
+                    clip.id
+                )));
+            }
+            let probe = asset.probe.as_ref().ok_or_else(|| {
+                MediaError::InvalidPlan(format!("clip {} has no validated probe metadata", clip.id))
+            })?;
+            if probe.audio.is_none() {
+                return Err(MediaError::InvalidPlan(format!(
+                    "clip {} has no audio stream",
+                    clip.id
+                )));
+            }
+            if clip.speed != one || clip.opacity != 1.0 {
+                return Err(MediaError::Unsupported(
+                    "layered export supports audio clips at normal speed only".into(),
+                ));
+            }
+            let source_start = ticks_to_seconds(clip.source_start, probe.stream_timebase)?;
+            let source_duration = ticks_to_seconds(clip.source_duration, probe.stream_timebase)?;
+            let timeline_start = ticks_to_seconds(clip.timeline_start, document.sequence.timebase)?;
+            let timeline_duration =
+                ticks_to_seconds(clip.timeline_duration, document.sequence.timebase)?;
+            if (source_duration - timeline_duration).abs() > 0.01 {
+                return Err(MediaError::Unsupported(
+                    "layered export requires clip source and timeline durations to match when speed is 1".into(),
+                ));
+            }
+            let input = resolve_safe_path(project_root, asset.relative_path.as_str())?;
+            if paths_alias(&input, &output) {
+                return Err(MediaError::PathViolation(
+                    "input and output paths must be distinct".into(),
+                ));
+            }
+            let input_index = inputs.len() + 1;
+            inputs.push(input.clone());
+            argv.extend([
+                "-ss".into(),
+                format_seconds(source_start),
+                "-t".into(),
+                format_seconds(source_duration),
+                "-i".into(),
+                input.to_string_lossy().into(),
+            ]);
+            duration = duration.max(timeline_start + timeline_duration);
+            audio_layers.push(AudioLayer {
+                input_index,
+                track_id: track.id.to_string(),
+                timeline_start,
+                effects: audio_effects(clip, document.sequence.timebase)?,
+            });
+        }
+    }
+    if video_layers.is_empty() {
+        return Err(MediaError::InvalidPlan(
+            "at least one enabled video clip is required for export".into(),
+        ));
+    }
+    if !duration.is_finite() || duration <= 0.0 {
+        return Err(MediaError::InvalidPlan(
+            "export duration must be positive".into(),
+        ));
+    }
+    if profile
+        .max_duration_seconds()
+        .is_some_and(|limit| duration > limit + 0.001)
+    {
+        return Err(MediaError::InvalidPlan(format!(
+            "{} export duration exceeds the platform preset limit",
+            profile_name(profile)
+        )));
+    }
+    argv[5] = format!(
+        "color=c=black:s={width}x{height}:r={frame_rate}:d={}",
+        format_seconds(duration)
+    );
+
+    let mut graph = "[0:v]format=yuv420p[base];".to_owned();
+    let mut current_video = "base".to_owned();
+    for (index, layer) in video_layers.iter().enumerate() {
+        let source_label = format!("v{index}");
+        let next_label = format!("v{index}_mix");
+        graph.push_str(&format!(
+            "[{input}:v]setpts=PTS-STARTPTS,scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,format=yuv420p,setpts=PTS+{start:.6}/TB[{source}];[{current}][{source}]overlay=eof_action=pass:shortest=0:enable='between(t\\,{start:.6}\\,{end:.6})'[{next}];",
+            input = layer.input_index,
+            start = layer.timeline_start,
+            end = layer.timeline_end,
+            source = source_label,
+            current = current_video,
+            next = next_label,
+        ));
+        current_video = next_label;
+    }
+    graph.push_str(&format!("[{current_video}]format=yuv420p[vout];"));
+
+    let mut audio_track_labels: Vec<(String, String)> = Vec::new();
+    for (layer_index, layer) in audio_layers.iter().enumerate() {
+        let label = format!("a{layer_index}");
+        let delay_ms = (layer.timeline_start * 1_000.0).round() as i64;
+        graph.push_str(&format!(
+            "[{input}:a]aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS{effects},adelay={delay}|{delay}[{label}];",
+            input = layer.input_index,
+            effects = layer.effects,
+            delay = delay_ms.max(0),
+            label = label,
+        ));
+        audio_track_labels.push((layer.track_id.clone(), label));
+    }
+
+    let mut mixed_tracks: Vec<(String, String)> = Vec::new();
+    for track in
+        document.sequence.tracks.iter().filter(|track| {
+            track.enabled && matches!(track.kind, TrackKind::Audio | TrackKind::Video)
+        })
+    {
+        let labels = audio_track_labels
+            .iter()
+            .filter(|(track_id, _)| track_id == track.id.as_str())
+            .map(|(_, label)| label.clone())
+            .collect::<Vec<_>>();
+        if labels.is_empty() {
+            continue;
+        }
+        let output_label = format!("track_{}", mixed_tracks.len());
+        if labels.len() == 1 {
+            graph.push_str(&format!("[{}]anull[{}];", labels[0], output_label));
+        } else {
+            for label in &labels {
+                graph.push_str(&format!("[{label}]"));
+            }
+            graph.push_str(&format!(
+                "amix=inputs={}:duration=longest:dropout_transition=0:normalize=0[{}];",
+                labels.len(),
+                output_label
+            ));
+        }
+        mixed_tracks.push((track.id.to_string(), output_label));
+    }
+
+    let mut source_counts = vec![0_usize; mixed_tracks.len()];
+    for track in document
+        .sequence
+        .tracks
+        .iter()
+        .filter(|track| track.enabled && matches!(track.kind, TrackKind::Audio))
+    {
+        let Some(ducking) = &track.ducking else {
+            continue;
+        };
+        mixed_tracks
+            .iter()
+            .position(|(track_id, _)| track_id == track.id.as_str())
+            .ok_or_else(|| MediaError::InvalidPlan("ducking target has no audio clips".into()))?;
+        let source_index = mixed_tracks
+            .iter()
+            .position(|(track_id, _)| track_id == ducking.source_track_id.as_str())
+            .ok_or_else(|| MediaError::InvalidPlan("ducking source has no audio clips".into()))?;
+        source_counts[source_index] += 1;
+    }
+
+    let mut final_tracks = mixed_tracks.clone();
+    let mut source_outputs = (0..mixed_tracks.len())
+        .map(|_| Vec::<String>::new())
+        .collect::<Vec<_>>();
+    for (index, count) in source_counts.iter().enumerate() {
+        if *count == 0 {
+            continue;
+        }
+        let source_label = final_tracks[index].1.clone();
+        let labels = (0..=*count)
+            .map(|fanout| format!("{source_label}_fan{fanout}"))
+            .collect::<Vec<_>>();
+        graph.push_str(&format!(
+            "[{source_label}]asplit={}[{}];",
+            labels.len(),
+            labels.join("][")
+        ));
+        final_tracks[index].1 = labels[0].clone();
+        source_outputs[index] = labels[1..].to_vec();
+    }
+
+    let mut source_cursors = vec![0_usize; mixed_tracks.len()];
+    for track in document
+        .sequence
+        .tracks
+        .iter()
+        .filter(|track| track.enabled && matches!(track.kind, TrackKind::Audio))
+    {
+        let Some(ducking) = &track.ducking else {
+            continue;
+        };
+        let target_index = final_tracks
+            .iter()
+            .position(|(track_id, _)| track_id == track.id.as_str())
+            .ok_or_else(|| MediaError::InvalidPlan("ducking target has no audio clips".into()))?;
+        let source_index = mixed_tracks
+            .iter()
+            .position(|(track_id, _)| track_id == ducking.source_track_id.as_str())
+            .ok_or_else(|| MediaError::InvalidPlan("ducking source has no audio clips".into()))?;
+        let cursor = source_cursors[source_index];
+        let source_label = source_outputs[source_index]
+            .get(cursor)
+            .cloned()
+            .ok_or_else(|| MediaError::InvalidPlan("ducking source fan-out is invalid".into()))?;
+        source_cursors[source_index] += 1;
+        let ducked_label = format!("ducked_{target_index}");
+        let threshold = 10_f64.powf(f64::from(ducking.threshold_db) / 20.0);
+        graph.push_str(&format!(
+            "[{}][{}]sidechaincompress=threshold={threshold:.8}:ratio={ratio:.4}:attack={attack:.4}:release={release:.4}:makeup=1[{}];",
+            final_tracks[target_index].1,
+            source_label,
+            ducked_label,
+            ratio = ducking.ratio,
+            attack = ducking.attack_ms,
+            release = ducking.release_ms,
+        ));
+        final_tracks[target_index].1 = ducked_label;
+    }
+
+    let has_audio = !final_tracks.is_empty();
+    if has_audio {
+        for (_, label) in &final_tracks {
+            graph.push_str(&format!("[{label}]"));
+        }
+        if final_tracks.len() == 1 {
+            graph.push_str("anull[aout];");
+        } else {
+            graph.push_str(&format!(
+                "amix=inputs={}:duration=longest:dropout_transition=0:normalize=0[aout];",
+                final_tracks.len()
+            ));
+        }
+    }
+
+    let output_temp = unique_temporary_output_path(&output, inputs.len())?;
+    let mut filter_argv = vec![
+        "-filter_complex".into(),
+        graph.clone(),
+        "-map".into(),
+        "[vout]".into(),
+    ];
+    if has_audio {
+        filter_argv.extend(["-map".into(), "[aout]".into()]);
+    }
+    filter_argv.extend([
+        "-c:v".into(),
+        "libx264".into(),
+        "-profile:v".into(),
+        "high".into(),
+        "-pix_fmt".into(),
+        "yuv420p".into(),
+        "-r".into(),
+        frame_rate,
+        "-b:v".into(),
+        profile.video_bitrate().into(),
+    ]);
+    if has_audio {
+        filter_argv.extend([
+            "-c:a".into(),
+            "aac".into(),
+            "-b:a".into(),
+            profile.audio_bitrate().into(),
+            "-ar".into(),
+            profile.audio_sample_rate().to_string(),
+            "-ac".into(),
+            profile.audio_channels().to_string(),
+        ]);
+    }
+    filter_argv.extend([
+        "-movflags".into(),
+        "+faststart".into(),
+        "-t".into(),
+        format_seconds(duration),
+        "-f".into(),
+        "mp4".into(),
+        "-progress".into(),
+        "pipe:1".into(),
+        output_temp.to_string_lossy().into(),
+    ]);
+    argv.extend(filter_argv);
+    Ok(RenderPlan {
+        steps: vec![RenderStep::Composite(CompositeStep {
+            inputs,
+            output: output_temp,
+            filter_complex: graph,
+            argv,
+        })],
+        concat_list: ConcatList {
+            path: unique_sibling_path(&output, "composite-plan"),
+            entries: Vec::new(),
+        },
+        output,
+        expected_output: ExpectedOutput {
+            stream_kinds: if has_audio {
+                vec![StreamKind::Video, StreamKind::Audio]
+            } else {
+                vec![StreamKind::Video]
+            },
+            duration_seconds: duration,
+            duration_tolerance_seconds: 0.25,
+        },
+        binary_contract: executables.binary_contract.clone(),
+    })
+}
+
+pub fn build_render_plan_with_profile(
+    document: &ProjectDocument,
+    project_root: &Path,
+    output: impl Into<PathBuf>,
+    executables: &ExecutableConfig,
+    profile: ExportProfile,
+) -> Result<LayeredRenderPlan, MediaError> {
+    if profile == ExportProfile::Baseline {
+        return Err(MediaError::Unsupported(
+            "baseline export uses the legacy render plan".into(),
+        ));
+    }
+    let output = output.into();
+    let render_plan = build_export_plan(document, project_root, output, executables, profile)?;
+    let RenderPlan {
+        steps,
+        output,
+        expected_output: legacy_expected,
+        binary_contract,
+        ..
+    } = render_plan;
+    let step = match steps.into_iter().next() {
+        Some(RenderStep::Composite(step)) => step,
+        _ => {
+            return Err(MediaError::InvalidPlan(
+                "profile export did not produce a composite step".into(),
+            ))
+        }
+    };
+    let (width, height) = profile.dimensions(document.sequence.width, document.sequence.height);
+    let has_audio = legacy_expected.stream_kinds.contains(&StreamKind::Audio);
+    let expected_output = ProfileExpectedOutput {
+        profile,
+        stream_kinds: legacy_expected.stream_kinds,
+        duration_seconds: legacy_expected.duration_seconds,
+        duration_tolerance_seconds: legacy_expected.duration_tolerance_seconds,
+        width,
+        height,
+        video_codec: "h264".into(),
+        audio_codec: has_audio.then(|| "aac".into()),
+        audio_sample_rate: has_audio.then(|| profile.audio_sample_rate()),
+        audio_channels: has_audio.then(|| profile.audio_channels()),
+        container: "mp4".into(),
+    };
+    expected_output.validate()?;
+    let plan = LayeredRenderPlan {
+        step,
+        output,
+        expected_output,
+        binary_contract,
+        profile,
+    };
+    validate_layered_render_plan(&plan, executables)?;
+    Ok(plan)
+}
+
+fn asset_for_clip<'a>(
+    document: &'a ProjectDocument,
+    clip: &Clip,
+) -> Result<&'a editor_domain::Asset, MediaError> {
+    document
+        .assets
+        .iter()
+        .find(|asset| asset.id == clip.asset_id)
+        .ok_or_else(|| {
+            MediaError::Domain(DomainError::NotFound {
+                entity: "asset".into(),
+                id: clip.asset_id.to_string(),
+            })
+        })
+}
+
+fn audio_effects(clip: &Clip, timebase: Rational) -> Result<String, MediaError> {
+    let mut filters = Vec::new();
+    let clip_duration = ticks_to_seconds(clip.timeline_duration, timebase)?;
+    for effect in &clip.effects {
+        match effect {
+            Effect::Volume { gain_db } => filters.push(format!("volume={gain_db:.4}dB")),
+            Effect::Fade {
+                kind: FadeKind::In,
+                duration_ticks,
+            } => filters.push(format!(
+                "afade=t=in:st=0:d={:.6}",
+                ticks_to_seconds(*duration_ticks, timebase)?
+            )),
+            Effect::Fade {
+                kind: FadeKind::Out,
+                duration_ticks,
+            } => {
+                let fade = ticks_to_seconds(*duration_ticks, timebase)?;
+                filters.push(format!(
+                    "afade=t=out:st={:.6}:d={fade:.6}",
+                    (clip_duration - fade).max(0.0)
+                ));
+            }
+            _ => {
+                return Err(MediaError::Unsupported(
+                    "audio layer contains an unsupported effect".into(),
+                ))
+            }
+        }
+    }
+    if filters.is_empty() {
+        Ok(String::new())
+    } else {
+        Ok(format!(",{}", filters.join(",")))
+    }
+}
+
+fn profile_name(profile: ExportProfile) -> &'static str {
+    match profile {
+        ExportProfile::Baseline => "Baseline",
+        ExportProfile::Youtube => "YouTube",
+        ExportProfile::Instagram => "Instagram",
+        ExportProfile::Tiktok => "TikTok",
+    }
+}
+
 fn ensure_concat_compatible(
     reference: &editor_domain::ProbeSummary,
     candidate: &editor_domain::ProbeSummary,
@@ -781,6 +1567,10 @@ fn ticks_to_seconds(ticks: i64, timebase: Rational) -> Result<f64, MediaError> {
 }
 fn format_seconds(seconds: f64) -> String {
     format!("{seconds:.6}")
+}
+
+fn format_rational(value: Rational) -> String {
+    format!("{}/{}", value.numerator, value.denominator)
 }
 
 pub fn validate_relative_alias(alias: &str) -> Result<(), MediaError> {
@@ -915,6 +1705,59 @@ impl FfmpegExecutor {
         }
         result
     }
+    pub fn execute_profile(
+        &self,
+        plan: &LayeredRenderPlan,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<VerifiedOutput, MediaError> {
+        let result = self.execute_profile_inner(plan, cancelled);
+        if result.is_err() {
+            cleanup_file(&plan.step.output);
+        }
+        result
+    }
+    fn execute_profile_inner(
+        &self,
+        plan: &LayeredRenderPlan,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<VerifiedOutput, MediaError> {
+        self.config
+            .validate_for_execution("ffmpeg", &self.config.ffmpeg)?;
+        self.config
+            .validate_for_execution("ffprobe", &self.config.ffprobe)?;
+        validate_layered_render_plan(plan, &self.config)?;
+        if let Some(parent) = plan.output.parent() {
+            if !parent.is_dir() {
+                return Err(MediaError::InvalidOutput(
+                    "output parent directory does not exist".into(),
+                ));
+            }
+        }
+        if cancelled() {
+            return Err(MediaError::Cancelled);
+        }
+        let output = run_cancellable(&self.config.ffmpeg, &plan.step.argv, cancelled)?;
+        if output.status_code != Some(0) {
+            return Err(MediaError::ProcessFailed {
+                code: output.status_code,
+                stderr: String::from_utf8_lossy(&output.stderr).into(),
+            });
+        }
+        let progress = parse_progress(&output.stdout);
+        let verified = finalize_temp_output_with(
+            &plan.step.output,
+            &plan.output,
+            &output,
+            &self.config,
+            cancelled,
+            |probe| plan.expected_output.matches_probe(probe),
+        )?;
+        Ok(VerifiedOutput {
+            probe: verified.probe,
+            decode_succeeded: verified.decode_succeeded,
+            progress,
+        })
+    }
     fn execute_inner(
         &self,
         plan: &RenderPlan,
@@ -926,11 +1769,12 @@ impl FfmpegExecutor {
         self.config
             .validate_for_execution("ffprobe", &self.config.ffprobe)?;
         validate_render_plan(plan, &self.config)?;
-        let concat = match plan.steps.last() {
-            Some(RenderStep::ConcatMux(step)) => step,
+        let final_temp = match plan.steps.last() {
+            Some(RenderStep::ConcatMux(step)) => &step.output,
+            Some(RenderStep::Composite(step)) => &step.output,
             _ => {
                 return Err(MediaError::InvalidPlan(
-                    "render plan must end with concat mux".into(),
+                    "render plan must end with a final media step".into(),
                 ))
             }
         };
@@ -941,7 +1785,13 @@ impl FfmpegExecutor {
                 ));
             }
         }
-        write_concat_list(list_path, &plan.concat_list.entries)?;
+        if plan
+            .steps
+            .iter()
+            .any(|step| matches!(step, RenderStep::ConcatMux(_)))
+        {
+            write_concat_list(list_path, &plan.concat_list.entries)?;
+        }
         let mut progress = Vec::new();
         for step in &plan.steps {
             if cancelled() {
@@ -967,7 +1817,7 @@ impl FfmpegExecutor {
             stderr: Vec::new(),
         };
         let verified = finalize_temp_output(
-            &concat.output,
+            final_temp,
             &plan.output,
             &plan.expected_output,
             &process,
@@ -981,6 +1831,70 @@ impl FfmpegExecutor {
         })
     }
 }
+
+fn validate_layered_render_plan(
+    plan: &LayeredRenderPlan,
+    config: &ExecutableConfig,
+) -> Result<(), MediaError> {
+    if plan.binary_contract != config.binary_contract
+        || plan.profile != plan.expected_output.profile
+    {
+        return Err(MediaError::InvalidPlan(
+            "profile render plan binary contract or profile is invalid".into(),
+        ));
+    }
+    plan.expected_output.validate()?;
+    validate_output_path(plan.output.clone())?;
+    let step = &plan.step;
+    if step.inputs.is_empty()
+        || step.output == plan.output
+        || !step.output.is_absolute()
+        || step.filter_complex.trim().is_empty()
+        || step.argv.is_empty()
+    {
+        return Err(MediaError::InvalidPlan(
+            "profile composite input, filter, or output is invalid".into(),
+        ));
+    }
+    if !step.argv.iter().any(|arg| arg == "-nostdin")
+        || !step
+            .argv
+            .windows(2)
+            .any(|pair| pair == ["-progress", "pipe:1"])
+        || !step.argv.windows(2).any(|pair| pair == ["-f", "mp4"])
+    {
+        return Err(MediaError::InvalidPlan(
+            "profile FFmpeg argv requires -nostdin, -f mp4, and progress output".into(),
+        ));
+    }
+    let filter_index = step
+        .argv
+        .iter()
+        .position(|arg| arg == "-filter_complex")
+        .ok_or_else(|| {
+            MediaError::InvalidPlan("profile argv has no filter_complex option".into())
+        })?;
+    if step.argv.get(filter_index + 1) != Some(&step.filter_complex)
+        || step.argv.last() != Some(&step.output.to_string_lossy().into_owned())
+    {
+        return Err(MediaError::InvalidPlan(
+            "profile argv does not match its typed composite step".into(),
+        ));
+    }
+    for input in &step.inputs {
+        if !input.is_absolute()
+            || !input.is_file()
+            || paths_alias(input, &plan.output)
+            || paths_alias(input, &step.output)
+        {
+            return Err(MediaError::PathViolation(
+                "profile input/output paths are invalid or aliased".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_render_plan(plan: &RenderPlan, config: &ExecutableConfig) -> Result<(), MediaError> {
     if plan.steps.is_empty() || plan.binary_contract != config.binary_contract {
         return Err(MediaError::InvalidPlan(
@@ -1017,6 +1931,25 @@ fn validate_render_plan(plan: &RenderPlan, config: &ExecutableConfig) -> Result<
                 for input in &value.inputs {
                     if !input.is_absolute() {
                         return Err(MediaError::PathViolation(input.to_string_lossy().into()));
+                    }
+                }
+            }
+            RenderStep::Composite(value) => {
+                if value.inputs.is_empty()
+                    || !value.output.is_absolute()
+                    || value.output == plan.output
+                    || value.filter_complex.trim().is_empty()
+                {
+                    return Err(MediaError::InvalidPlan(
+                        "composite input, filter, or output is invalid".into(),
+                    ));
+                }
+                for input in &value.inputs {
+                    if !input.is_absolute() || !input.is_file() || paths_alias(input, &plan.output)
+                    {
+                        return Err(MediaError::PathViolation(
+                            "composite input/output paths are invalid or aliased".into(),
+                        ));
                     }
                 }
             }
@@ -1142,6 +2075,22 @@ fn finalize_temp_output(
     config: &ExecutableConfig,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<InternalFinalization, MediaError> {
+    finalize_temp_output_with(temp, output, process, config, cancelled, |probe| {
+        expected.matches_probe(probe)
+    })
+}
+
+fn finalize_temp_output_with<F>(
+    temp: &Path,
+    output: &Path,
+    process: &ProcessOutput,
+    config: &ExecutableConfig,
+    cancelled: &dyn Fn() -> bool,
+    validate_expected: F,
+) -> Result<InternalFinalization, MediaError>
+where
+    F: FnOnce(&ProbeMetadata) -> Result<(), MediaError>,
+{
     if process.status_code != Some(0) {
         return Err(MediaError::ProcessFailed {
             code: process.status_code,
@@ -1158,7 +2107,7 @@ fn finalize_temp_output(
         ));
     }
     let probe = probe_media(config, temp, &SystemChildProcessRunner)?;
-    expected.matches_probe(&probe)?;
+    validate_expected(&probe)?;
     let decode_succeeded = decode_output(config, temp)?;
     if !decode_succeeded {
         return Err(MediaError::InvalidOutput(
@@ -1242,6 +2191,7 @@ fn cleanup_plan_temps(plan: &RenderPlan) {
         match step {
             RenderStep::TrimClip(value) => cleanup_file(&value.output),
             RenderStep::ConcatMux(value) => cleanup_file(&value.output),
+            RenderStep::Composite(value) => cleanup_file(&value.output),
         }
     }
 }
@@ -1410,6 +2360,136 @@ mod tests {
         ));
         fs::remove_dir_all(root).unwrap();
     }
+    #[test]
+    fn export_profiles_build_fixed_layered_filter_plans() {
+        let root = temp_dir();
+        let doc = document(&root, Rational::new(30, 1).unwrap(), "h264");
+        let plan = build_render_plan_with_profile(
+            &doc,
+            &root,
+            root.join("youtube.mp4"),
+            &ExecutableConfig::new(root.join("ffmpeg.exe"), root.join("ffprobe.exe")),
+            ExportProfile::Youtube,
+        )
+        .unwrap();
+        assert_eq!(plan.expected_output.width, 1920);
+        assert_eq!(plan.expected_output.height, 1080);
+        assert!(plan.step.filter_complex.contains("overlay="));
+        assert!(plan.step.filter_complex.contains("amix="));
+        assert!(plan.step.argv.windows(2).any(|pair| pair == ["-f", "mp4"]));
+        assert!(plan
+            .step
+            .argv
+            .windows(2)
+            .any(|pair| pair == ["-progress", "pipe:1"]));
+        assert_eq!(
+            plan.step.argv.last(),
+            Some(&plan.step.output.to_string_lossy().into_owned())
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn export_plan_connects_audio_layers_with_sidechain_ducking() {
+        let root = temp_dir();
+        let mut doc = document(&root, Rational::new(30, 1).unwrap(), "h264");
+        fs::write(root.join("media/music.wav"), [3]).unwrap();
+        let audio_probe = {
+            let mut probe = summary(Rational::new(30, 1).unwrap(), "aac");
+            probe.video = None;
+            probe
+        };
+        doc.assets.push(Asset {
+            id: editor_domain::AssetId::new("music-asset").unwrap(),
+            relative_path: editor_domain::RelativePath::new("media/music.wav").unwrap(),
+            kind: AssetKind::Audio,
+            fingerprint: Fingerprint {
+                size_bytes: 1,
+                modified_time: "test".into(),
+                sha256: None,
+            },
+            probe: Some(audio_probe),
+            status: AssetStatus::Available,
+        });
+        let mut voice = Track::new(
+            editor_domain::TrackId::new("voice").unwrap(),
+            TrackKind::Audio,
+            "Voice",
+        )
+        .unwrap();
+        voice.clips.push(Clip {
+            id: ClipId::new("voice-clip").unwrap(),
+            asset_id: editor_domain::AssetId::new("asset-a").unwrap(),
+            timeline_start: 0,
+            timeline_duration: 30,
+            source_start: 0,
+            source_duration: 30,
+            speed: Rational::new(1, 1).unwrap(),
+            opacity: 1.0,
+            transform: Transform::default(),
+            effects: Vec::new(),
+            keyframes: Vec::new(),
+        });
+        let mut music = Track::new(
+            editor_domain::TrackId::new("music").unwrap(),
+            TrackKind::Audio,
+            "Music",
+        )
+        .unwrap();
+        music.ducking = Some(editor_domain::DuckingConfig {
+            source_track_id: editor_domain::TrackId::new("voice").unwrap(),
+            threshold_db: -24.0,
+            ratio: 4.0,
+            attack_ms: 20.0,
+            release_ms: 250.0,
+        });
+        music.clips.push(Clip {
+            id: ClipId::new("music-clip").unwrap(),
+            asset_id: editor_domain::AssetId::new("music-asset").unwrap(),
+            timeline_start: 0,
+            timeline_duration: 30,
+            source_start: 0,
+            source_duration: 30,
+            speed: Rational::new(1, 1).unwrap(),
+            opacity: 1.0,
+            transform: Transform::default(),
+            effects: Vec::new(),
+            keyframes: Vec::new(),
+        });
+        doc.sequence.tracks.push(voice);
+        doc.sequence.tracks.push(music);
+        let plan = build_render_plan_with_profile(
+            &doc,
+            &root,
+            root.join("tiktok.mp4"),
+            &ExecutableConfig::new(root.join("ffmpeg.exe"), root.join("ffprobe.exe")),
+            ExportProfile::Tiktok,
+        )
+        .unwrap();
+        assert_eq!(plan.expected_output.width, 1080);
+        assert_eq!(plan.expected_output.height, 1920);
+        assert!(plan.step.filter_complex.contains("sidechaincompress="));
+        assert!(plan.step.filter_complex.contains("asplit="));
+        assert_eq!(
+            plan.expected_output.stream_kinds,
+            vec![StreamKind::Video, StreamKind::Audio]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn export_profile_serialization_is_stable() {
+        assert_eq!(
+            ExportProfile::parse("youtube").unwrap(),
+            ExportProfile::Youtube
+        );
+        assert_eq!(
+            serde_json::to_string(&ExportProfile::Instagram).unwrap(),
+            "\"instagram\""
+        );
+        assert_eq!(ExportProfile::default(), ExportProfile::Baseline);
+    }
+
     #[test]
     fn cleanup_removes_all_plan_temps() {
         let root = temp_dir();

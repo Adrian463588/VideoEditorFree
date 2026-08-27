@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('core', 'ai', 'all')]
+    [ValidateSet('core', 'subtitles', 'ai', 'all')]
     [string]$Profile = 'all',
     [string]$InstallRoot = '',
     [string]$ManifestPath = '',
@@ -224,6 +224,11 @@ if ($llama) {
 $piper = $selected | Where-Object id -eq 'piper-windows-x64-runtime'
 if ($piper) {
     Expand-ArchiveTree $downloaded[$piper.id] (Join-Path $InstallRoot 'ai\piper') 'piper.exe'
+}
+
+$whisper = $selected | Where-Object id -eq 'whisper-cpp-windows-x64'
+if ($whisper) {
+    Expand-ArchiveTree $downloaded[$whisper.id] (Join-Path $InstallRoot 'ai\whisper') 'whisper-cli.exe'
 }
 
 $state = [ordered]@{

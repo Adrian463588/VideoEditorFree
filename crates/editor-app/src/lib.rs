@@ -52,6 +52,7 @@ pub struct MediaJobRequest {
     pub kind: JobKind,
     pub snapshot: ProjectSnapshot,
     pub output_path: Option<RelativePath>,
+    pub profile: editor_media::ExportProfile,
     pub cancellation: CancellationToken,
 }
 
@@ -180,18 +181,35 @@ impl MediaPort for ConfiguredMediaPort {
             .as_ref()
             .ok_or_else(|| AppError::invalid_request("media jobs require an output path"))?;
         let output = Self::output_path(&runtime, relative)?;
-        let plan = editor_media::build_render_plan(
-            &request.snapshot.document,
-            &runtime.root,
-            output,
-            &config,
-        )
-        .map_err(media_error)?;
         let executor = editor_media::FfmpegExecutor::new(config);
-        executor
-            .execute(&plan, &|| request.cancellation.is_cancelled())
-            .map(|_| ())
-            .map_err(media_error)
+        if request.kind == JobKind::Export
+            && request.profile != editor_media::ExportProfile::Baseline
+        {
+            let plan = editor_media::build_render_plan_with_profile(
+                &request.snapshot.document,
+                &runtime.root,
+                output,
+                executor.config(),
+                request.profile,
+            )
+            .map_err(media_error)?;
+            executor
+                .execute_profile(&plan, &|| request.cancellation.is_cancelled())
+                .map(|_| ())
+                .map_err(media_error)
+        } else {
+            let plan = editor_media::build_render_plan(
+                &request.snapshot.document,
+                &runtime.root,
+                output,
+                executor.config(),
+            )
+            .map_err(media_error)?;
+            executor
+                .execute(&plan, &|| request.cancellation.is_cancelled())
+                .map(|_| ())
+                .map_err(media_error)
+        }
     }
 }
 
@@ -230,6 +248,14 @@ where
         kind: JobKind,
         output_path: Option<RelativePath>,
     ) -> Result<JobId, AppError> {
+        self.start_media_job_with_profile(kind, output_path, editor_media::ExportProfile::Baseline)
+    }
+    pub fn start_media_job_with_profile(
+        &self,
+        kind: JobKind,
+        output_path: Option<RelativePath>,
+        profile: editor_media::ExportProfile,
+    ) -> Result<JobId, AppError> {
         let snapshot = self.snapshot()?;
         let handle = self.jobs.submit(kind, snapshot.metadata.clone())?;
         self.jobs.start(handle.id)?;
@@ -238,6 +264,7 @@ where
             kind,
             snapshot,
             output_path: output_path.clone(),
+            profile,
             cancellation: handle.token.clone(),
         };
         match self.media.start(request) {
@@ -259,6 +286,21 @@ where
     where
         M: Clone + Send + 'static,
     {
+        self.start_media_job_async_with_profile(
+            kind,
+            output_path,
+            editor_media::ExportProfile::Baseline,
+        )
+    }
+    pub fn start_media_job_async_with_profile(
+        &self,
+        kind: JobKind,
+        output_path: Option<RelativePath>,
+        profile: editor_media::ExportProfile,
+    ) -> Result<JobId, AppError>
+    where
+        M: Clone + Send + 'static,
+    {
         let snapshot = self.snapshot()?;
         let handle = self.jobs.submit(kind, snapshot.metadata.clone())?;
         self.jobs.start(handle.id)?;
@@ -267,6 +309,7 @@ where
             kind,
             snapshot,
             output_path: output_path.clone(),
+            profile,
             cancellation: handle.token.clone(),
         };
         let jobs = self.jobs.clone();
@@ -354,6 +397,8 @@ fn retryable_for_io(error: &editor_media::MediaError) -> bool {
 mod tests {
     use super::*;
     use editor_domain::{ProjectId, TimelineOperation};
+    use std::sync::mpsc::{self, Sender};
+    use std::time::Duration;
     struct MemoryProject(ProjectDocument);
     impl ProjectPort for MemoryProject {
         fn current_document(&self) -> Result<ProjectDocument, AppError> {
@@ -361,6 +406,18 @@ mod tests {
         }
         fn commit_document(&mut self, document: &ProjectDocument) -> Result<(), AppError> {
             self.0 = document.clone();
+            Ok(())
+        }
+    }
+    #[derive(Clone)]
+    struct RecordingMediaPort {
+        sender: Sender<editor_media::ExportProfile>,
+    }
+    impl MediaPort for RecordingMediaPort {
+        fn start(&self, request: MediaJobRequest) -> Result<(), AppError> {
+            self.sender
+                .send(request.profile)
+                .expect("recording receiver remains available");
             Ok(())
         }
     }
@@ -382,6 +439,30 @@ mod tests {
         let error = app.start_media_job(JobKind::Export, None).unwrap_err();
         assert_eq!(error.code, "MEDIA_UNAVAILABLE");
         assert_eq!(app.jobs().list()[0].state, JobState::Failed);
+    }
+    #[test]
+    fn async_media_job_carries_export_profile() {
+        let (sender, receiver) = mpsc::channel();
+        let app = EditorApplication::new(
+            MemoryProject(project()),
+            RecordingMediaPort { sender },
+            JobRegistry::new(4, 1).unwrap(),
+        );
+        let id = app
+            .start_media_job_async_with_profile(
+                JobKind::Export,
+                None,
+                editor_media::ExportProfile::Instagram,
+            )
+            .unwrap();
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            editor_media::ExportProfile::Instagram
+        );
+        assert!(matches!(
+            app.job(id).unwrap().state,
+            JobState::Running | JobState::Succeeded
+        ));
     }
     #[test]
     fn timeline_revision_conflict_is_preserved() {

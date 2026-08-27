@@ -11,11 +11,17 @@ checks the declared byte count and SHA-256, and extracts only the required
 runtime files (including native DLLs that an executable needs). A failed
 checksum never becomes an installed runtime.
 
+The **Subtitle AI** profile is separate from the larger assistant bundle. It
+installs the official whisper.cpp Windows CLI and multilingual `ggml-tiny.bin`
+model, so automatic captions can run locally without downloading the LLM or
+TTS packs.
+
 Sources selected for the Windows x64 manifest:
 
 - FFmpeg Windows builds listed by the [FFmpeg download page](https://ffmpeg.org/download.html), using the BtbN GPL archive and its published checksum list.
 - [llama.cpp b10642 Windows CPU release](https://github.com/ggml-org/llama.cpp/releases/tag/b10642).
-- [whisper.cpp tiny.en model](https://huggingface.co/ggerganov/whisper.cpp).
+- [whisper.cpp v1.9.0 Windows CLI](https://github.com/ggml-org/whisper.cpp/releases/tag/v1.9.0)
+  and [multilingual tiny model](https://huggingface.co/ggerganov/whisper.cpp).
 - [Qwen2.5 0.5B Instruct GGUF](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF).
 - [Piper Windows runtime](https://github.com/rhasspy/piper/releases/tag/2023.11.14-2)
   and [lessac medium voice](https://huggingface.co/rhasspy/piper-voices/tree/v1.0.0/en/en_US/lessac/medium).
