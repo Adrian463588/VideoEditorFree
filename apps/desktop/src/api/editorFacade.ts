@@ -193,6 +193,48 @@ const statusSnapshot = (status: HostStatus, project: ProjectDocument | null = nu
   connectionMessage: status.core.reason,
 });
 
+const hostCapabilityEqual = (
+  left: { state: string; reason: string } | undefined,
+  right: { state: string; reason: string } | undefined,
+) => left?.state === right?.state && left?.reason === right?.reason;
+
+const hostStatusUnchanged = (status: HostStatus, current: EditorSnapshot) =>
+  current.connection === status.core.state
+  && (current.project !== null) === status.projectLoaded
+  && current.capabilities.mediaRuntime === status.media.state
+  && hostCapabilityEqual(status.ai, current.capabilities.assistant)
+  && hostCapabilityEqual(status.subtitles, current.capabilities.subtitles)
+  && hostCapabilityEqual(status.tts, current.capabilities.tts)
+  && hostCapabilityEqual(status.effects, current.capabilities.effects)
+  && hostCapabilityEqual(status.audioDucking, current.capabilities.audioDucking)
+  && hostCapabilityEqual(status.exportProfiles, current.capabilities.exportProfiles);
+
+const errorDetailsEqual = (left: Record<string, string> | null, right: Record<string, string> | null) => {
+  if (left === right) return true;
+  if (!left || !right) return false;
+  const leftKeys = Object.keys(left);
+  const rightKeys = Object.keys(right);
+  return leftKeys.length === rightKeys.length && leftKeys.every((key) => left[key] === right[key]);
+};
+
+const jobEqual = (left: JobRecord, right: JobRecord) =>
+  left.id === right.id
+  && left.kind === right.kind
+  && left.state === right.state
+  && left.snapshot.base_revision === right.snapshot.base_revision
+  && left.snapshot.snapshot_hash === right.snapshot.snapshot_hash
+  && left.stage === right.stage
+  && left.progress === right.progress
+  && left.message === right.message
+  && left.output_path === right.output_path
+  && left.error?.code === right.error?.code
+  && left.error?.message === right.error?.message
+  && left.error?.retryable === right.error?.retryable
+  && errorDetailsEqual(left.error?.details ?? null, right.error?.details ?? null);
+
+const jobsEqual = (left: JobRecord[], right: JobRecord[]) =>
+  left.length === right.length && left.every((job, index) => jobEqual(job, right[index]));
+
 const commandName = (command: EditorCommand) => ({
   bundleDownload: "bundle_download",
   projectCreate: "project_create",
@@ -227,9 +269,15 @@ const transportErrorCode = (error: unknown) => {
 const isMissingHostCommand = (error: unknown) => /(?:command|invoke).*(?:not found|unknown|unavailable|not allowed)/i.test(transportErrorMessage(error));
 const isUnavailableHostError = (error: unknown) => /(?:UNAVAILABLE|NOT_PROVISIONED|MEDIA_UNAVAILABLE|PREVIEW_UNAVAILABLE|AI_UNAVAILABLE|AI_BUSY|AI_PLAN_TIMEOUT|AI_PLAN_OUTPUT_LIMIT|AI_PLAN_FAILED|AI_PLAN_INVALID|TTS_RUNTIME_UNAVAILABLE|TTS_GENERATION_FAILED|TTS_GENERATION_CANCELLED|SUBTITLE_RUNTIME_UNAVAILABLE|AI_TRANSCRIPTION_FAILED|AI_TRANSCRIPTION_OUTPUT_LIMIT|AI_TRANSCRIPTION_CANCELLED|BUNDLE_DOWNLOAD_FAILED|BUNDLE_SCRIPT_MISSING|BUNDLE_MANIFEST_MISSING)/i.test(transportErrorCode(error))
   || /(?:not provisioned|no (?:reviewed|verified) .* provisioned|runtime is unavailable)/i.test(transportErrorMessage(error));
+const unavailableSnapshot: EditorSnapshot = {
+  ...emptyEditorSnapshot,
+  connection: "UNAVAILABLE",
+  connectionMessage: unavailableMessage,
+};
 
 const createTauriEditorFacade = (transport: CommandTransport): EditorFacade => {
   let snapshot = emptyEditorSnapshot;
+  let snapshotRequest: Promise<EditorSnapshot> | null = null;
   let projectPath: string | null = null;
   const listeners = new Set<(event: EditorEvent) => void>();
   const notify = (event: EditorEvent) => listeners.forEach((listener) => listener(event));
@@ -255,12 +303,18 @@ const createTauriEditorFacade = (transport: CommandTransport): EditorFacade => {
       if (typeof selected !== "string" || !selected.trim()) return null;
       return projectRelativePath(selected.trim(), projectPath);
     },
-    getSnapshot: async () => {
-      const hostStatus = await transport("host_status", undefined);
-      const jobs = await transport("job_list", undefined);
-      snapshot = statusSnapshot(hostStatus, snapshot.project, jobs);
-      notify({ type: "snapshotUpdated", snapshot });
-      return snapshot;
+    getSnapshot: () => {
+      if (snapshotRequest) return snapshotRequest;
+      snapshotRequest = (async () => {
+        const hostStatus = await transport("host_status", undefined);
+        const jobs = await transport("job_list", undefined);
+        if (hostStatusUnchanged(hostStatus, snapshot) && jobsEqual(jobs, snapshot.jobs)) return snapshot;
+        snapshot = statusSnapshot(hostStatus, snapshot.project, jobs);
+        return snapshot;
+      })().finally(() => {
+        snapshotRequest = null;
+      });
+      return snapshotRequest;
     },
     dispatch: async (command) => {
       try {
@@ -437,7 +491,7 @@ const createTauriEditorFacade = (transport: CommandTransport): EditorFacade => {
 };
 
 export const createUnavailableEditorFacade = (): EditorFacade => ({
-  getSnapshot: async () => ({ ...emptyEditorSnapshot, connection: "UNAVAILABLE", connectionMessage: unavailableMessage }),
+  getSnapshot: async () => unavailableSnapshot,
   chooseExportPath: async () => null,
   dispatch: async () => ({ status: "UNAVAILABLE", message: unavailableMessage }),
   subscribe: () => () => undefined,

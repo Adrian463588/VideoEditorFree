@@ -2536,14 +2536,21 @@ mod tests {
         ProbeSummary, ProjectId, RelativePath, RgbColor, RgbDelta, TextOverlay, Track, TrackId,
         TrackKind, Transform, VideoStream,
     };
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{
+        sync::atomic::{AtomicU64, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+    static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
     fn temp_dir() -> PathBuf {
+        let sequence = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "editor-media-{}",
+            "editor-media-{}-{}-{}",
+            std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            sequence,
         ))
     }
     fn summary(timebase: Rational, codec: &str) -> ProbeSummary {

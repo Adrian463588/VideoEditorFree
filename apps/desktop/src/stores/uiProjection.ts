@@ -32,6 +32,8 @@ export const uiProjection = {
     return () => listeners.delete(listener);
   },
   patch: (next: Partial<UiProjection>) => {
+    const keys = Object.keys(next) as Array<keyof UiProjection>;
+    if (keys.length === 0 || keys.every((key) => Object.is(projection[key], next[key]))) return;
     projection = { ...projection, ...next };
     listeners.forEach((listener) => listener());
   },

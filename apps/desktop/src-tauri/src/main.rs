@@ -204,6 +204,10 @@ impl From<editor_project::ProjectError> for HostError {
                 "PROJECT_IO_FAILED",
                 "The project could not be read or written.",
             ),
+            editor_project::ProjectError::SizeLimit { .. } => Self::new(
+                "PROJECT_TOO_LARGE",
+                "The project file exceeds the safe memory limit.",
+            ),
             _ => Self::new(
                 "PROJECT_INVALID",
                 "The project document is invalid or unsupported.",
@@ -1334,14 +1338,16 @@ fn generated_project_id() -> ProjectId {
     ProjectId::new(format!("project-{}", *value)).expect("generated project ID is valid")
 }
 fn set_loaded_project(host: &mut HostState, document: ProjectDocument, path: Option<PathBuf>) {
+    let revision = document.revision;
     host.shared.replace(document);
+    host.app.invalidate_snapshot_cache();
     host.media.set_root(
         path.as_deref()
             .and_then(Path::parent)
             .unwrap_or_else(|| Path::new(".")),
     );
     host.project_path = path;
-    host.saved_revision = host.shared.current_document().ok().map(|doc| doc.revision);
+    host.saved_revision = Some(revision);
 }
 fn parse_job_id(raw: &str) -> Result<JobId, HostError> {
     raw.parse::<u64>()
@@ -1882,6 +1888,7 @@ fn subtitle_generate(
             .map_err(HostError::from)?
             .document;
         host.shared.replace(document.clone());
+        host.app.invalidate_snapshot_cache();
         Ok(document)
     })();
     let document = match postprocess {
@@ -2163,6 +2170,7 @@ fn tts_generate(
             .map_err(HostError::from)?
             .document;
         host.shared.replace(document.clone());
+        host.app.invalidate_snapshot_cache();
         Ok((relative, document))
     })();
     let (relative, document) = match postprocess {
@@ -2513,6 +2521,7 @@ fn assistant_apply(
         last.ok_or_else(|| HostError::new("AI_PLAN_INVALID", "The edit plan is empty."))?;
     result.document = document.clone();
     host.shared.replace(document);
+    host.app.invalidate_snapshot_cache();
     Ok(result)
 }
 

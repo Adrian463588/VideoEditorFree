@@ -343,6 +343,18 @@ Progress uses a typed Tauri channel or a small event facade. Large media, transc
 
 Do not leak full local paths, model prompts, or command lines into user-facing errors unless the user explicitly opens diagnostics.
 
+### 8.1 Resource and payload budgets
+
+The V1 desktop keeps resource limits explicit so a malformed or accidentally huge project cannot exhaust the Rust process or WebView heap:
+
+- A `.vdeproj` file and a serialized job snapshot are limited to 16 MiB.
+- Relative asset references are limited to 4,096 bytes and user-visible project/track/marker metadata has explicit bounded lengths.
+- The domain accepts at most 4,096 assets, 64 tracks, 2,048 clips per track, 8,192 total clips, 4,096 markers, 64 effects per clip, and 4,096 keyframes per clip.
+- The frontend polls only while visible, coalesces concurrent snapshot requests, and publishes a snapshot only when host capability or job data changes.
+- Project snapshot hashes are cached by canonical document revision; mutations invalidate the cache.
+
+These are safety budgets, not a claim that every project size has been benchmarked. A limit returns a typed failure and never fabricates a truncated project or successful media result.
+
 ## 9. Persistence and recovery
 
 ### Canonical JSON

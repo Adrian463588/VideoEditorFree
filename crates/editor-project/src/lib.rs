@@ -13,7 +13,7 @@ use std::{
     ffi::OsString,
     fmt,
     fs::{self, OpenOptions},
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
 };
@@ -21,6 +21,7 @@ use std::{
 pub const PROJECT_EXTENSION: &str = "vdeproj";
 pub const TEMPORARY_SUFFIX: &str = ".tmp";
 pub const BACKUP_SUFFIX: &str = ".bak";
+pub const MAX_PROJECT_FILE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum ProjectError {
@@ -39,6 +40,10 @@ pub enum ProjectError {
         operation: &'static str,
         path: PathBuf,
         source: io::Error,
+    },
+    SizeLimit {
+        path: PathBuf,
+        max_bytes: usize,
     },
     Json {
         path: PathBuf,
@@ -100,6 +105,11 @@ impl fmt::Display for ProjectError {
                 path,
                 source,
             } => write!(formatter, "{operation} {}: {source}", path.display()),
+            Self::SizeLimit { path, max_bytes } => write!(
+                formatter,
+                "project file exceeds the {max_bytes}-byte limit: {}",
+                path.display()
+            ),
             Self::Json { path, source } => {
                 write!(
                     formatter,
@@ -531,11 +541,25 @@ pub fn recover_project(project_path: impl AsRef<Path>) -> Result<RecoveredProjec
 }
 
 fn read_document(path: &Path) -> Result<ProjectDocument, ProjectError> {
-    let bytes = fs::read(path).map_err(|source| ProjectError::Io {
+    let file = fs::File::open(path).map_err(|source| ProjectError::Io {
         operation: "read project",
         path: path.to_path_buf(),
         source,
     })?;
+    let mut bytes = Vec::with_capacity(64 * 1024);
+    file.take((MAX_PROJECT_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|source| ProjectError::Io {
+            operation: "read project",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if bytes.len() > MAX_PROJECT_FILE_BYTES {
+        return Err(ProjectError::SizeLimit {
+            path: path.to_path_buf(),
+            max_bytes: MAX_PROJECT_FILE_BYTES,
+        });
+    }
     let value: Value = serde_json::from_slice(&bytes).map_err(|source| ProjectError::Json {
         path: path.to_path_buf(),
         source,
@@ -560,6 +584,12 @@ fn canonical_json(document: &ProjectDocument, project_path: &Path) -> Result<Str
         source,
     })?;
     json.push('\n');
+    if json.len() > MAX_PROJECT_FILE_BYTES {
+        return Err(ProjectError::SizeLimit {
+            path: project_path.to_path_buf(),
+            max_bytes: MAX_PROJECT_FILE_BYTES,
+        });
+    }
     Ok(json)
 }
 
@@ -899,6 +929,22 @@ mod tests {
         assert!(matches!(
             load_project(&path),
             Err(ProjectError::Json { .. })
+        ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn oversized_project_is_rejected_before_json_parsing() {
+        let directory = test_directory();
+        let path = project_path(&directory);
+        fs::write(&path, vec![b'x'; MAX_PROJECT_FILE_BYTES + 1]).unwrap();
+
+        assert!(matches!(
+            load_project(&path),
+            Err(ProjectError::SizeLimit {
+                max_bytes: MAX_PROJECT_FILE_BYTES,
+                ..
+            })
         ));
         fs::remove_dir_all(directory).unwrap();
     }

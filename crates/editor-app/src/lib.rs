@@ -4,11 +4,54 @@ use editor_domain::{ApplyResult, ProjectDocument, RelativePath, TimelineOperatio
 use editor_jobs::{CancellationToken, JobId, JobKind, JobRecord, JobRegistry, SnapshotMetadata};
 use serde::{Deserialize, Serialize};
 use std::{
+    io::{self, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
 pub use editor_jobs::{AppError, JobState, ProgressStage};
+
+pub const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
+
+struct BoundedJsonWriter {
+    size: usize,
+    limit: usize,
+    exceeded: bool,
+    hash: u64,
+}
+
+impl BoundedJsonWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            size: 0,
+            limit,
+            exceeded: false,
+            hash: 0xcbf29ce484222325,
+        }
+    }
+}
+
+impl Write for BoundedJsonWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > self.limit.saturating_sub(self.size) {
+            self.exceeded = true;
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "serialized snapshot exceeds the configured limit",
+            ));
+        }
+        for byte in bytes {
+            self.hash ^= u64::from(*byte);
+            self.hash = self.hash.wrapping_mul(0x100000001b3);
+        }
+        self.size += bytes.len();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 pub trait ProjectPort {
     fn current_document(&self) -> Result<ProjectDocument, AppError>;
@@ -23,27 +66,24 @@ pub struct ProjectSnapshot {
 impl ProjectSnapshot {
     pub fn capture(document: ProjectDocument) -> Result<Self, AppError> {
         document.validate()?;
-        let bytes = serde_json::to_vec(&document).map_err(|error| {
-            AppError::new(
-                "SNAPSHOT_SERIALIZATION_FAILED",
-                error.to_string(),
-                false,
-                None,
-            )
-        })?;
+        let mut writer = BoundedJsonWriter::new(MAX_SNAPSHOT_BYTES);
+        if let Err(error) = serde_json::to_writer(&mut writer, &document) {
+            let (code, retryable, message) = if writer.exceeded {
+                (
+                    "SNAPSHOT_TOO_LARGE",
+                    false,
+                    format!("The project snapshot exceeds the {MAX_SNAPSHOT_BYTES}-byte limit."),
+                )
+            } else {
+                ("SNAPSHOT_SERIALIZATION_FAILED", false, error.to_string())
+            };
+            return Err(AppError::new(code, message, retryable, None));
+        }
         Ok(Self {
-            metadata: SnapshotMetadata::new(document.revision, stable_hash(&bytes))?,
+            metadata: SnapshotMetadata::new(document.revision, format!("{:016x}", writer.hash))?,
             document,
         })
     }
-}
-fn stable_hash(bytes: &[u8]) -> String {
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{hash:016x}")
 }
 
 #[derive(Clone, Debug)]
@@ -217,6 +257,7 @@ pub struct EditorApplication<P, M> {
     project: P,
     media: M,
     jobs: JobRegistry,
+    snapshot_metadata_cache: Mutex<Option<SnapshotMetadata>>,
 }
 impl<P, M> EditorApplication<P, M>
 where
@@ -228,10 +269,35 @@ where
             project,
             media,
             jobs,
+            snapshot_metadata_cache: Mutex::new(None),
         }
     }
     pub fn snapshot(&self) -> Result<ProjectSnapshot, AppError> {
-        ProjectSnapshot::capture(self.project.current_document()?)
+        let document = self.project.current_document()?;
+        if let Some(cached) = self
+            .snapshot_metadata_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .filter(|cached| cached.base_revision == document.revision)
+        {
+            return Ok(ProjectSnapshot {
+                document,
+                metadata: cached.clone(),
+            });
+        }
+        let snapshot = ProjectSnapshot::capture(document)?;
+        *self
+            .snapshot_metadata_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(snapshot.metadata.clone());
+        Ok(snapshot)
+    }
+    pub fn invalidate_snapshot_cache(&self) {
+        *self
+            .snapshot_metadata_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
     pub fn apply_timeline(
         &mut self,
@@ -241,6 +307,7 @@ where
         let current = self.project.current_document()?;
         let result = current.apply(base_revision, operation)?;
         self.project.commit_document(&result.document)?;
+        self.invalidate_snapshot_cache();
         Ok(result)
     }
     pub fn start_media_job(

@@ -5,9 +5,22 @@
 //! IR and the mutations that can safely change it.
 
 use serde::{Deserialize, Serialize};
-use std::{error::Error, fmt};
+use std::{collections::HashSet, error::Error, fmt, hash::Hash};
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const MAX_PROJECT_ASSETS: usize = 4_096;
+pub const MAX_SEQUENCE_TRACKS: usize = 64;
+pub const MAX_TRACK_CLIPS: usize = 2_048;
+pub const MAX_TOTAL_CLIPS: usize = 8_192;
+pub const MAX_SEQUENCE_MARKERS: usize = 4_096;
+pub const MAX_CLIP_EFFECTS: usize = 64;
+pub const MAX_CLIP_KEYFRAMES: usize = 4_096;
+pub const MAX_RELATIVE_PATH_BYTES: usize = 4_096;
+pub const MAX_PROJECT_NAME_BYTES: usize = 256;
+pub const MAX_TRACK_NAME_BYTES: usize = 256;
+pub const MAX_MARKER_NAME_BYTES: usize = 256;
+pub const MAX_MARKER_COMMENT_BYTES: usize = 4_096;
+pub const MAX_PROBE_TEXT_BYTES: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DomainError {
@@ -157,19 +170,7 @@ pub struct RelativePath(String);
 impl RelativePath {
     pub fn new(value: impl Into<String>) -> Result<Self, DomainError> {
         let value = value.into();
-        if value.is_empty()
-            || value == "/"
-            || value.starts_with('/')
-            || value.starts_with('\\')
-            || value.as_bytes().get(1) == Some(&b':')
-            || value.chars().any(char::is_control)
-            || value.split(['/', '\\']).any(|component| component == "..")
-        {
-            return Err(DomainError::InvalidValue {
-                field: "relative_path".to_owned(),
-                reason: "must be non-empty, relative, and free of traversal components".to_owned(),
-            });
-        }
+        validate_relative_path(&value)?;
         Ok(Self(value))
     }
 
@@ -178,8 +179,28 @@ impl RelativePath {
     }
 
     pub fn validate(&self) -> Result<(), DomainError> {
-        Self::new(self.0.clone()).map(|_| ())
+        validate_relative_path(&self.0)
     }
+}
+
+fn validate_relative_path(value: &str) -> Result<(), DomainError> {
+    if value.is_empty()
+        || value.len() > MAX_RELATIVE_PATH_BYTES
+        || value == "/"
+        || value.starts_with('/')
+        || value.starts_with('\\')
+        || value.as_bytes().get(1) == Some(&b':')
+        || value.chars().any(char::is_control)
+        || value.split(['/', '\\']).any(|component| component == "..")
+    {
+        return Err(DomainError::InvalidValue {
+            field: "relative_path".to_owned(),
+            reason: format!(
+                "must be 1..={MAX_RELATIVE_PATH_BYTES} bytes, relative, and free of traversal components"
+            ),
+        });
+    }
+    Ok(())
 }
 
 impl fmt::Display for RelativePath {
@@ -304,6 +325,11 @@ impl Fingerprint {
         if self.modified_time.is_empty() {
             return Err(invalid("fingerprint.modified_time", "must not be empty"));
         }
+        bounded_string(
+            "fingerprint.modified_time",
+            &self.modified_time,
+            MAX_PROBE_TEXT_BYTES,
+        )?;
         if let Some(hash) = &self.sha256 {
             let valid =
                 hash.len() == 64 && hash.chars().all(|character| character.is_ascii_hexdigit());
@@ -339,6 +365,7 @@ impl VideoStream {
         if self.codec.trim().is_empty() {
             return Err(invalid("probe.video.codec", "must not be empty"));
         }
+        bounded_string("probe.video.codec", &self.codec, MAX_PROBE_TEXT_BYTES)?;
         if self.width == 0 || self.height == 0 {
             return Err(invalid("probe.video", "width and height must be positive"));
         }
@@ -361,6 +388,7 @@ impl AudioStream {
         if self.codec.trim().is_empty() {
             return Err(invalid("probe.audio.codec", "must not be empty"));
         }
+        bounded_string("probe.audio.codec", &self.codec, MAX_PROBE_TEXT_BYTES)?;
         if self.sample_rate == 0 || self.channels == 0 {
             return Err(invalid(
                 "probe.audio",
@@ -407,6 +435,11 @@ impl ProbeSummary {
         if self.raw_tool_version.trim().is_empty() {
             return Err(invalid("probe.raw_tool_version", "must not be empty"));
         }
+        bounded_string(
+            "probe.raw_tool_version",
+            &self.raw_tool_version,
+            MAX_PROBE_TEXT_BYTES,
+        )?;
         Ok(())
     }
 }
@@ -800,6 +833,18 @@ impl Clip {
             ));
         }
         self.transform.validate()?;
+        if self.effects.len() > MAX_CLIP_EFFECTS {
+            return Err(invalid(
+                "clip.effects",
+                "exceeds the supported effect count",
+            ));
+        }
+        if self.keyframes.len() > MAX_CLIP_KEYFRAMES {
+            return Err(invalid(
+                "clip.keyframes",
+                "exceeds the supported keyframe count",
+            ));
+        }
         match (&asset.kind, &self.text_overlay) {
             (AssetKind::Text, Some(text_overlay)) => text_overlay.validate()?,
             (AssetKind::Text, None) => {
@@ -868,6 +913,10 @@ impl Track {
         self.id.validate()?;
         if self.name.trim().is_empty() {
             return Err(invalid("track.name", "must not be empty"));
+        }
+        bounded_string("track.name", &self.name, MAX_TRACK_NAME_BYTES)?;
+        if self.clips.len() > MAX_TRACK_CLIPS {
+            return Err(invalid("track.clips", "exceeds the supported clip count"));
         }
         if let Some(ducking) = &self.ducking {
             if !matches!(self.kind, TrackKind::Audio) {
@@ -986,6 +1035,10 @@ impl Marker {
         if self.name.trim().is_empty() {
             return Err(invalid("marker.name", "must not be empty"));
         }
+        bounded_string("marker.name", &self.name, MAX_MARKER_NAME_BYTES)?;
+        if let Some(comment) = &self.comment {
+            bounded_string("marker.comment", comment, MAX_MARKER_COMMENT_BYTES)?;
+        }
         if self
             .color_tag
             .as_ref()
@@ -1040,6 +1093,18 @@ impl Sequence {
                 "audio sample rate and channels must be positive",
             ));
         }
+        if self.tracks.len() > MAX_SEQUENCE_TRACKS {
+            return Err(invalid(
+                "sequence.tracks",
+                "exceeds the supported track count",
+            ));
+        }
+        if self.markers.len() > MAX_SEQUENCE_MARKERS {
+            return Err(invalid(
+                "sequence.markers",
+                "exceeds the supported marker count",
+            ));
+        }
         ensure_unique(self.tracks.iter().map(|track| &track.id), "track")?;
         ensure_unique(self.markers.iter().map(|marker| &marker.id), "marker")?;
         for track in &self.tracks {
@@ -1070,6 +1135,7 @@ impl ProjectDocument {
         if name.trim().is_empty() {
             return Err(invalid("project.name", "must not be empty"));
         }
+        bounded_string("project.name", &name, MAX_PROJECT_NAME_BYTES)?;
         Ok(Self {
             schema_version: CURRENT_SCHEMA_VERSION,
             revision: 0,
@@ -1092,25 +1158,43 @@ impl ProjectDocument {
         if self.name.trim().is_empty() {
             return Err(invalid("project.name", "must not be empty"));
         }
+        bounded_string("project.name", &self.name, MAX_PROJECT_NAME_BYTES)?;
         self.project_root.validate()?;
+        if self.assets.len() > MAX_PROJECT_ASSETS {
+            return Err(invalid(
+                "project.assets",
+                "exceeds the supported asset count",
+            ));
+        }
         ensure_unique(self.assets.iter().map(|asset| &asset.id), "asset")?;
         for asset in &self.assets {
             asset.validate()?;
         }
         self.sequence.validate(&self.assets)?;
 
-        let mut clip_ids = Vec::new();
+        let total_clips: usize = self
+            .sequence
+            .tracks
+            .iter()
+            .map(|track| track.clips.len())
+            .sum();
+        if total_clips > MAX_TOTAL_CLIPS {
+            return Err(invalid(
+                "project.clips",
+                "exceeds the supported total clip count",
+            ));
+        }
+        let mut clip_ids: HashSet<&ClipId> = HashSet::with_capacity(total_clips);
         for track in &self.sequence.tracks {
             for clip in &track.clips {
-                if clip_ids.iter().any(|seen: &ClipId| seen == &clip.id) {
+                if !clip_ids.insert(&clip.id) {
                     return Err(invalid("clip.id", "duplicate clip ID"));
                 }
-                clip_ids.push(clip.id.clone());
             }
         }
         for marker in &self.sequence.markers {
             if let Some(clip_id) = &marker.clip_id {
-                if !clip_ids.iter().any(|seen| seen == clip_id) {
+                if !clip_ids.contains(clip_id) {
                     return Err(DomainError::NotFound {
                         entity: "clip".to_owned(),
                         id: clip_id.to_string(),
@@ -1979,14 +2063,13 @@ fn next_split_id(
 fn ensure_unique<'a, I, T>(values: I, kind: &str) -> Result<(), DomainError>
 where
     I: IntoIterator<Item = &'a T>,
-    T: Eq + fmt::Display + 'a,
+    T: Eq + Hash + fmt::Display + 'a,
 {
-    let mut seen = Vec::new();
+    let mut seen = HashSet::new();
     for value in values {
-        if seen.contains(&value) {
+        if !seen.insert(value) {
             return Err(invalid(&format!("{kind}.id"), "duplicate ID"));
         }
-        seen.push(value);
     }
     Ok(())
 }
@@ -1995,6 +2078,17 @@ fn invalid(field: &str, reason: &str) -> DomainError {
     DomainError::InvalidValue {
         field: field.to_owned(),
         reason: reason.to_owned(),
+    }
+}
+
+fn bounded_string(field: &str, value: &str, max_bytes: usize) -> Result<(), DomainError> {
+    if value.len() <= max_bytes {
+        Ok(())
+    } else {
+        Err(invalid(
+            field,
+            &format!("must be at most {max_bytes} bytes"),
+        ))
     }
 }
 
@@ -2071,6 +2165,16 @@ mod tests {
         assert!(Rational::new(0, 1).is_err());
         let invalid: Rational = serde_json::from_str(r#"{"numerator":2,"denominator":4}"#).unwrap();
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn relative_paths_are_bounded_and_revalidated() {
+        assert!(RelativePath::new("../outside.mp4").is_err());
+        assert!(RelativePath::new("C:\\outside.mp4").is_err());
+        assert!(RelativePath::new("a".repeat(MAX_RELATIVE_PATH_BYTES + 1)).is_err());
+
+        let path = RelativePath::new("media/video.mp4").unwrap();
+        assert!(path.validate().is_ok());
     }
 
     #[test]
@@ -2513,6 +2617,32 @@ mod tests {
             preserve_pitch: false,
         };
         assert!(speed.validate().is_err());
+    }
+
+    #[test]
+    fn project_collection_limits_fail_before_large_timeline_validation() {
+        let (mut project, _, asset_id) = project_with_track();
+        let mut effect_clip = clip("effect-clip", asset_id.clone(), 0);
+        effect_clip.effects = vec![Effect::Brightness { value: 0.1 }; MAX_CLIP_EFFECTS + 1];
+        project.sequence.tracks[0].clips = vec![effect_clip];
+        assert!(matches!(
+            project.validate(),
+            Err(DomainError::InvalidValue { field, .. }) if field == "clip.effects"
+        ));
+
+        project.sequence.tracks[0].clips = (0..=MAX_TRACK_CLIPS)
+            .map(|index| {
+                clip(
+                    &format!("clip-{index}"),
+                    asset_id.clone(),
+                    index as i64 * 30,
+                )
+            })
+            .collect();
+        assert!(matches!(
+            project.validate(),
+            Err(DomainError::InvalidValue { field, .. }) if field == "track.clips"
+        ));
     }
 
     #[test]
