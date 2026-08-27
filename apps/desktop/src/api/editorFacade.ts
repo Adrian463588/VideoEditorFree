@@ -5,6 +5,7 @@ import type {
   ExportProfile,
   HostStatus,
   JobRecord,
+  ProjectAsset,
   ProjectClip,
   ProjectDocument,
   ProjectTrack,
@@ -25,18 +26,33 @@ export type EditorCommand =
   | { type: "previewSeek"; timelineTicks: number }
   | { type: "jobCancel"; jobId: string }
   | { type: "subtitleGenerate"; assetId: string; language: string; baseRevision: number; trackId?: string }
-  | { type: "assistantPlan"; baseRevision: number; text: string };
+  | { type: "ttsGenerate"; text: string; voiceId: string; baseRevision: number; trackId?: string }
+  | { type: "assistantPlan"; baseRevision: number; text: string }
+  | { type: "assistantApply"; plan: AssistantPlan };
 
 export type TimelineOperation =
+  | { AddAsset: { asset: ProjectAsset } }
+  | { DeleteAsset: { asset_id: string } }
   | { AddTrack: { track: ProjectTrack } }
+  | { DeleteTrack: { track_id: string } }
   | { AddClip: { track_id: string; clip: ProjectClip } }
+  | { ReplaceClipAsset: { clip_id: string; asset_id: string } }
+  | { RelinkAsset: { asset_id: string; relative_path: string; fingerprint: ProjectAsset["fingerprint"]; probe: ProjectAsset["probe"]; status: ProjectAsset["status"] } }
   | { SetTrackState: { track_id: string; enabled?: boolean; locked?: boolean } }
   | { SetTrackDucking: { track_id: string; ducking: { source_track_id: string; threshold_db: number; ratio: number; attack_ms: number; release_ms: number } | null } }
+  | { MoveClip: { clip_id: string; timeline_start: number } }
+  | { MoveClipToTrack: { clip_id: string; track_id: string; timeline_start: number } }
+  | { TrimClip: { clip_id: string; source_start: number; source_end: number } }
   | { SplitClip: { clip_id: string; at_timeline_tick: number } }
-  | { DeleteClip: { clip_id: string } };
+  | { DeleteClip: { clip_id: string } }
+  | { RippleDelete: { track_id: string; clip_id: string } }
+  | { SetClipEffects: { clip_id: string; effects: ProjectClip["effects"] } }
+  | { SetClipVisuals: { clip_id: string; opacity: number; transform: ProjectClip["transform"] } }
+  | { AddMarker: { marker: ProjectDocument["sequence"]["markers"][number] } }
+  | { DeleteMarker: { marker_id: string } };
 
 export type EditorCommandResult =
-  | { status: "accepted"; message: string; snapshot?: EditorSnapshot; subtitle?: SubtitleGenerationResponse }
+  | { status: "accepted"; message: string; snapshot?: EditorSnapshot; subtitle?: SubtitleGenerationResponse; tts?: TtsGenerationResponse; assistant?: AssistantPlanResponse }
   | { status: "BLOCKED" | "UNAVAILABLE"; message: string };
 
 export type EditorEvent =
@@ -62,11 +78,31 @@ interface ExportRequest { outputPath: string; profile: ExportProfile; baseRevisi
 interface BundleDownloadRequest { profile: "core" | "subtitles" | "ai" | "all" }
 interface BundleDownloadResponse { profile: string; installRoot: string; mediaReady: boolean; message: string }
 interface SubtitleGenerateRequest { assetId: string; language: string; baseRevision: number; trackId?: string }
+interface TtsGenerateRequest { text: string; voiceId: string; baseRevision: number; trackId?: string }
 export interface SubtitleGenerationResponse {
   job: JobRecord;
   document: ProjectDocument;
   language: string;
   cueCount: number | null;
+  message: string;
+}
+export interface TtsGenerationResponse {
+  job: JobRecord;
+  document: ProjectDocument;
+  voiceId: string;
+  relativePath: string;
+  message: string;
+}
+export interface AssistantPlan {
+  base_revision: number;
+  operations: Array<Record<string, unknown>>;
+  warnings: string[];
+  affected_clips: string[];
+  requires_confirmation: boolean;
+}
+export interface AssistantPlanResponse {
+  plan: AssistantPlan;
+  provenance: { provider: string; model_id: string; model_version: string };
   message: string;
 }
 
@@ -93,7 +129,9 @@ interface CommandSpec {
   export: { args: ExportRequest; result: JobRecord };
   export_start: { args: ExportRequest; result: JobRecord };
   subtitle_generate: { args: SubtitleGenerateRequest; result: SubtitleGenerationResponse };
-  assistant_plan: { args: { baseRevision: number; text: string }; result: void };
+  tts_generate: { args: TtsGenerateRequest; result: TtsGenerationResponse };
+  assistant_plan: { args: { baseRevision: number; text: string }; result: AssistantPlanResponse };
+  assistant_apply: { args: { plan: AssistantPlan }; result: ApplyResult };
 }
 
 /** Single typed IPC boundary. Components only depend on EditorFacade. */
@@ -132,6 +170,16 @@ const statusSnapshot = (status: HostStatus, project: ProjectDocument | null = nu
       state: status.subtitles?.state ?? "UNAVAILABLE",
       reason: status.subtitles?.reason ?? "The host does not expose a verified subtitle generation capability.",
     },
+    tts: {
+      id: "local-tts",
+      label: "Local voiceover generation",
+      state: status.tts?.state ?? "UNAVAILABLE",
+      reason: status.tts?.reason ?? "The host does not expose a verified Piper voice runtime.",
+    },
+    effects: status.effects ?? {
+      state: "UNAVAILABLE",
+      reason: "The host does not expose typed visual effects.",
+    },
     audioDucking: status.audioDucking ?? {
       state: "UNAVAILABLE",
       reason: "The host does not expose typed audio ducking.",
@@ -159,7 +207,9 @@ const commandName = (command: EditorCommand) => ({
   previewSeek: "preview_seek",
   jobCancel: "job_cancel",
   subtitleGenerate: "subtitle_generate",
+  ttsGenerate: "tts_generate",
   assistantPlan: "assistant_plan",
+  assistantApply: "assistant_apply",
 }[command.type]);
 
 const transportErrorMessage = (error: unknown) => {
@@ -175,7 +225,7 @@ const transportErrorCode = (error: unknown) => {
 };
 
 const isMissingHostCommand = (error: unknown) => /(?:command|invoke).*(?:not found|unknown|unavailable|not allowed)/i.test(transportErrorMessage(error));
-const isUnavailableHostError = (error: unknown) => /(?:UNAVAILABLE|NOT_PROVISIONED|MEDIA_UNAVAILABLE|PREVIEW_UNAVAILABLE|AI_UNAVAILABLE|SUBTITLE_RUNTIME_UNAVAILABLE|AI_TRANSCRIPTION_FAILED|AI_TRANSCRIPTION_CANCELLED|BUNDLE_DOWNLOAD_FAILED|BUNDLE_SCRIPT_MISSING|BUNDLE_MANIFEST_MISSING)/i.test(transportErrorCode(error))
+const isUnavailableHostError = (error: unknown) => /(?:UNAVAILABLE|NOT_PROVISIONED|MEDIA_UNAVAILABLE|PREVIEW_UNAVAILABLE|AI_UNAVAILABLE|AI_BUSY|AI_PLAN_TIMEOUT|AI_PLAN_OUTPUT_LIMIT|AI_PLAN_FAILED|AI_PLAN_INVALID|TTS_RUNTIME_UNAVAILABLE|TTS_GENERATION_FAILED|TTS_GENERATION_CANCELLED|SUBTITLE_RUNTIME_UNAVAILABLE|AI_TRANSCRIPTION_FAILED|AI_TRANSCRIPTION_OUTPUT_LIMIT|AI_TRANSCRIPTION_CANCELLED|BUNDLE_DOWNLOAD_FAILED|BUNDLE_SCRIPT_MISSING|BUNDLE_MANIFEST_MISSING)/i.test(transportErrorCode(error))
   || /(?:not provisioned|no (?:reviewed|verified) .* provisioned|runtime is unavailable)/i.test(transportErrorMessage(error));
 
 const createTauriEditorFacade = (transport: CommandTransport): EditorFacade => {
@@ -341,9 +391,33 @@ const createTauriEditorFacade = (transport: CommandTransport): EditorFacade => {
             notify({ type: "jobUpdated", job: result.job });
             return { status: "accepted", message: result.message, snapshot, subtitle: result };
           }
-          case "assistantPlan":
-            await transport("assistant_plan", { baseRevision: command.baseRevision, text: command.text });
-            return { status: "accepted", message: "Assistant plan ready for review." };
+          case "ttsGenerate": {
+            if (snapshot.capabilities.tts.state !== "READY") {
+              return { status: "UNAVAILABLE", message: `UNAVAILABLE — ${snapshot.capabilities.tts.reason}` };
+            }
+            const result = await transport("tts_generate", {
+              text: command.text,
+              voiceId: command.voiceId,
+              baseRevision: command.baseRevision,
+              trackId: command.trackId,
+            });
+            setProject(result.document, `Voiceover generated at revision ${result.document.revision}.`);
+            snapshot = { ...snapshot, jobs: [...snapshot.jobs.filter((item) => item.id !== result.job.id), result.job] };
+            notify({ type: "jobUpdated", job: result.job });
+            return { status: "accepted", message: result.message, snapshot, tts: result };
+          }
+          case "assistantPlan": {
+            if (snapshot.capabilities.assistant.state !== "READY") {
+              return { status: "UNAVAILABLE", message: `UNAVAILABLE — ${snapshot.capabilities.assistant.reason}` };
+            }
+            const result = await transport("assistant_plan", { baseRevision: command.baseRevision, text: command.text });
+            return { status: "accepted", message: result.message, assistant: result };
+          }
+          case "assistantApply": {
+            const result = await transport("assistant_apply", { plan: command.plan });
+            setProject(result.document, `Assistant plan applied at revision ${result.document.revision}.`);
+            return { status: "accepted", message: snapshot.connectionMessage, snapshot };
+          }
         }
       } catch (error) {
         if (isUnavailableHostError(error)) {

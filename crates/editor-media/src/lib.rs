@@ -6,7 +6,7 @@
 
 use editor_domain::{
     AssetKind, AssetStatus, Clip, ClipId, DomainError, Effect, FadeKind, ProjectDocument, Rational,
-    TrackKind, Transform,
+    RgbColor, TextOverlay, TrackKind, Transform,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -21,6 +21,9 @@ use std::{
     thread,
     time::Duration,
 };
+
+const MAX_PROCESS_OUTPUT_BYTES: usize = 1024 * 1024;
+const MAX_PROGRESS_EVENTS: usize = 4096;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BinaryManifest {
@@ -941,6 +944,17 @@ struct VideoLayer {
     input_index: usize,
     timeline_start: f64,
     timeline_end: f64,
+    is_overlay: bool,
+    filter: String,
+    opacity: f32,
+    transform: Transform,
+}
+
+#[derive(Clone, Debug)]
+struct TextLayer {
+    overlay: TextOverlay,
+    timeline_start: f64,
+    timeline_end: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -982,16 +996,14 @@ pub fn build_export_plan(
     ];
     let mut inputs = Vec::new();
     let mut video_layers = Vec::new();
+    let mut text_layers = Vec::new();
     let mut audio_layers = Vec::new();
     let mut duration = 0.0_f64;
     let one = Rational::new(1, 1).expect("constant rational is valid");
 
-    for track in document
-        .sequence
-        .tracks
-        .iter()
-        .filter(|track| track.enabled && matches!(track.kind, TrackKind::Video))
-    {
+    for track in document.sequence.tracks.iter().filter(|track| {
+        track.enabled && matches!(track.kind, TrackKind::Video | TrackKind::Overlay)
+    }) {
         for clip in &track.clips {
             let asset = asset_for_clip(document, clip)?;
             if !matches!(asset.kind, AssetKind::Video | AssetKind::Image)
@@ -1011,14 +1023,9 @@ pub fn build_export_plan(
                     clip.id
                 )));
             }
-            if clip.speed != one
-                || !clip.effects.is_empty()
-                || !clip.keyframes.is_empty()
-                || clip.opacity != 1.0
-                || clip.transform != Transform::default()
-            {
+            if clip.speed != one || !clip.keyframes.is_empty() {
                 return Err(MediaError::Unsupported(
-                    "layered export currently supports clean video clips; remove unsupported visual effects first".into(),
+                    "layered export requires normal-speed clips without keyframes".into(),
                 ));
             }
             let source_start = ticks_to_seconds(clip.source_start, probe.stream_timebase)?;
@@ -1056,15 +1063,49 @@ pub fn build_export_plan(
                 input_index,
                 timeline_start,
                 timeline_end,
+                is_overlay: matches!(track.kind, TrackKind::Overlay),
+                filter: video_effects(clip, project_root, document.sequence.timebase)?,
+                opacity: clip.opacity,
+                transform: clip.transform.clone(),
             });
-            if probe.audio.is_some() {
+            if probe.audio.is_some() && matches!(track.kind, TrackKind::Video) {
                 audio_layers.push(AudioLayer {
                     input_index,
                     track_id: track.id.to_string(),
                     timeline_start,
-                    effects: String::new(),
+                    effects: audio_effects(clip, document.sequence.timebase, true)?,
                 });
             }
+        }
+    }
+
+    for track in document
+        .sequence
+        .tracks
+        .iter()
+        .filter(|track| track.enabled && matches!(track.kind, TrackKind::Text))
+    {
+        for clip in &track.clips {
+            let asset = asset_for_clip(document, clip)?;
+            if !matches!(asset.kind, AssetKind::Text) {
+                return Err(MediaError::InvalidPlan(format!(
+                    "text clip {} requires a text asset",
+                    clip.id
+                )));
+            }
+            let overlay = clip.text_overlay.clone().ok_or_else(|| {
+                MediaError::InvalidPlan(format!("text clip {} has no overlay content", clip.id))
+            })?;
+            let timeline_start = ticks_to_seconds(clip.timeline_start, document.sequence.timebase)?;
+            let timeline_duration =
+                ticks_to_seconds(clip.timeline_duration, document.sequence.timebase)?;
+            let timeline_end = timeline_start + timeline_duration;
+            duration = duration.max(timeline_end);
+            text_layers.push(TextLayer {
+                overlay,
+                timeline_start,
+                timeline_end,
+            });
         }
     }
 
@@ -1129,7 +1170,7 @@ pub fn build_export_plan(
                 input_index,
                 track_id: track.id.to_string(),
                 timeline_start,
-                effects: audio_effects(clip, document.sequence.timebase)?,
+                effects: audio_effects(clip, document.sequence.timebase, false)?,
             });
         }
     }
@@ -1162,13 +1203,49 @@ pub fn build_export_plan(
     for (index, layer) in video_layers.iter().enumerate() {
         let source_label = format!("v{index}");
         let next_label = format!("v{index}_mix");
+        let effects = format!(
+            "{}{}{}",
+            layer.filter,
+            transform_scale_filter(&layer.transform, layer.is_overlay),
+            transform_rotate_filter(&layer.transform),
+        );
+        if layer.is_overlay {
+            graph.push_str(&format!(
+                "[{input}:v]setpts=PTS-STARTPTS{effects},format=rgba,colorchannelmixer=aa={opacity:.6},setpts=PTS+{start:.6}/TB[{source}];[{current}][{source}]overlay=x='(main_w-overlay_w)/2+({position_x:.6}*main_w/2)':y='(main_h-overlay_h)/2+({position_y:.6}*main_h/2)':eof_action=pass:shortest=0:enable='between(t\\,{start:.6}\\,{end:.6})'[{next}];",
+                input = layer.input_index,
+                effects = effects,
+                opacity = layer.opacity,
+                position_x = layer.transform.position_x,
+                position_y = layer.transform.position_y,
+                start = layer.timeline_start,
+                end = layer.timeline_end,
+                source = source_label,
+                current = current_video,
+                next = next_label,
+            ));
+        } else {
+            graph.push_str(&format!(
+                "[{input}:v]setpts=PTS-STARTPTS{effects},scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,format=rgba,colorchannelmixer=aa={opacity:.6},format=yuv420p,setpts=PTS+{start:.6}/TB[{source}];[{current}][{source}]overlay=eof_action=pass:shortest=0:enable='between(t\\,{start:.6}\\,{end:.6})'[{next}];",
+                input = layer.input_index,
+                effects = effects,
+                opacity = layer.opacity,
+                start = layer.timeline_start,
+                end = layer.timeline_end,
+                source = source_label,
+                current = current_video,
+                next = next_label,
+            ));
+        }
+        current_video = next_label;
+    }
+    for (index, layer) in text_layers.iter().enumerate() {
+        let next_label = format!("text_{index}");
         graph.push_str(&format!(
-            "[{input}:v]setpts=PTS-STARTPTS,scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,format=yuv420p,setpts=PTS+{start:.6}/TB[{source}];[{current}][{source}]overlay=eof_action=pass:shortest=0:enable='between(t\\,{start:.6}\\,{end:.6})'[{next}];",
-            input = layer.input_index,
+            "[{current}]drawtext={drawtext}:enable='between(t\\,{start:.6}\\,{end:.6})'[{next}];",
+            current = current_video,
+            drawtext = drawtext_filter(&layer.overlay)?,
             start = layer.timeline_start,
             end = layer.timeline_end,
-            source = source_label,
-            current = current_video,
             next = next_label,
         ));
         current_video = next_label;
@@ -1457,7 +1534,183 @@ fn asset_for_clip<'a>(
         })
 }
 
-fn audio_effects(clip: &Clip, timebase: Rational) -> Result<String, MediaError> {
+fn video_effects(
+    clip: &Clip,
+    project_root: &Path,
+    _timebase: Rational,
+) -> Result<String, MediaError> {
+    let mut filters = Vec::new();
+    for effect in &clip.effects {
+        match effect {
+            Effect::Brightness { value } => {
+                filters.push(format!("eq=brightness={value:.6}"));
+            }
+            Effect::Contrast { value } => {
+                filters.push(format!("eq=contrast={value:.6}"));
+            }
+            Effect::Saturation { value } => {
+                filters.push(format!("eq=saturation={value:.6}"));
+            }
+            Effect::Exposure { value } => {
+                filters.push(format!("exposure=exposure={value:.6}"));
+            }
+            Effect::Gamma { value } => {
+                filters.push(format!("eq=gamma={value:.6}"));
+            }
+            Effect::Temperature { kelvin } => {
+                filters.push(format!("colortemperature=temperature={kelvin:.6}"));
+            }
+            Effect::Tint { value } => {
+                filters.push(format!("colorbalance=rm={value:.6}:gm={value:.6}:bm={:.6}", -value));
+            }
+            Effect::ColorBalance {
+                shadows,
+                midtones,
+                highlights,
+            } => filters.push(format!(
+                "colorbalance=rs={:.6}:gs={:.6}:bs={:.6}:rm={:.6}:gm={:.6}:bm={:.6}:rh={:.6}:gh={:.6}:bh={:.6}",
+                shadows.red,
+                shadows.green,
+                shadows.blue,
+                midtones.red,
+                midtones.green,
+                midtones.blue,
+                highlights.red,
+                highlights.green,
+                highlights.blue,
+            )),
+            Effect::Crop {
+                left,
+                top,
+                right,
+                bottom,
+            } => filters.push(format!(
+                "crop=iw*(1-{left:.6}-{right:.6}):ih*(1-{top:.6}-{bottom:.6}):iw*{left:.6}:ih*{top:.6}"
+            )),
+            Effect::Rotate { degrees } => filters.push(format!(
+                "rotate={:.6}:ow=rotw(iw):oh=roth(ih):c=none",
+                f64::from(*degrees) * std::f64::consts::PI / 180.0
+            )),
+            Effect::Blur { radius } => filters.push(format!("gblur=sigma={radius:.6}")),
+            Effect::Sharpen { amount } => {
+                filters.push(format!("unsharp=5:5:{amount:.6}:5:5:0"));
+            }
+            Effect::Vignette { amount } => filters.push(format!(
+                "vignette=angle={:.6}",
+                0.2 + f64::from(*amount) * 1.2
+            )),
+            Effect::Duotone {
+                shadows,
+                highlights,
+            } => filters.push(duotone_filter(*shadows, *highlights)),
+            Effect::Lut { relative_path } => {
+                if relative_path
+                    .as_str()
+                    .rsplit('.')
+                    .next()
+                    .is_none_or(|extension| !extension.eq_ignore_ascii_case("cube"))
+                {
+                    return Err(MediaError::Unsupported(
+                        "LUT effects require a project-relative .cube file".into(),
+                    ));
+                }
+                let path = resolve_safe_path(project_root, relative_path.as_str())?;
+                filters.push(format!("lut3d='{}'", escape_filter_value(&path.to_string_lossy())));
+            }
+            Effect::Speed { .. } | Effect::Volume { .. } | Effect::Fade { .. } => {}
+        }
+    }
+    if filters.is_empty() {
+        Ok(String::new())
+    } else {
+        Ok(format!(",{}", filters.join(",")))
+    }
+}
+
+fn duotone_filter(shadows: RgbColor, highlights: RgbColor) -> String {
+    let component = |shadow: u8, highlight: u8| {
+        let slope = (f64::from(highlight) - f64::from(shadow)) / 255.0;
+        format!("{shadow}+val*{slope:.9}")
+    };
+    format!(
+        "hue=s=0,lutrgb=r='{}':g='{}':b='{}'",
+        component(shadows.red, highlights.red),
+        component(shadows.green, highlights.green),
+        component(shadows.blue, highlights.blue),
+    )
+}
+
+fn transform_scale_filter(transform: &Transform, overlay: bool) -> String {
+    if (transform.scale_x - 1.0).abs() < f32::EPSILON
+        && (transform.scale_y - 1.0).abs() < f32::EPSILON
+    {
+        return String::new();
+    }
+    let flags = if overlay { ":flags=lanczos" } else { "" };
+    format!(
+        ",scale=iw*{:.6}:ih*{:.6}{flags}",
+        transform.scale_x.max(0.01),
+        transform.scale_y.max(0.01),
+    )
+}
+
+fn transform_rotate_filter(transform: &Transform) -> String {
+    if transform.rotation_degrees.abs() < f32::EPSILON {
+        return String::new();
+    }
+    format!(
+        ",rotate={:.6}:ow=rotw(iw):oh=roth(ih):c=none",
+        f64::from(transform.rotation_degrees) * std::f64::consts::PI / 180.0
+    )
+}
+
+fn escape_filter_value(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace(':', "\\:")
+        .replace(',', "\\,")
+        .replace(';', "\\;")
+        .replace('\'', "\\'")
+}
+
+fn drawtext_filter(overlay: &TextOverlay) -> Result<String, MediaError> {
+    let color = format!("0x{}", &overlay.color[1..]);
+    let mut options = vec![
+        format!("text='{}'", escape_filter_value(&overlay.text)),
+        format!("fontcolor={color}"),
+        format!("fontsize={:.2}", overlay.font_size),
+        format!("x=(w-text_w)/2+({:.6}*w/2)", overlay.position_x),
+        format!("y=(h-text_h)/2+({:.6}*h/2)", overlay.position_y),
+    ];
+    if let Some(font) = default_font_file() {
+        options.insert(
+            0,
+            format!(
+                "fontfile='{}'",
+                escape_filter_value(&font.to_string_lossy())
+            ),
+        );
+    }
+    Ok(options.join(":"))
+}
+
+fn default_font_file() -> Option<PathBuf> {
+    let root = std::env::var_os("WINDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("C:/Windows"));
+    let windows_font = root.join("Fonts").join("arial.ttf");
+    if windows_font.is_file() {
+        return Some(windows_font);
+    }
+    let linux_font = PathBuf::from("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf");
+    linux_font.is_file().then_some(linux_font)
+}
+
+fn audio_effects(
+    clip: &Clip,
+    timebase: Rational,
+    ignore_visual_effects: bool,
+) -> Result<String, MediaError> {
     let mut filters = Vec::new();
     let clip_duration = ticks_to_seconds(clip.timeline_duration, timebase)?;
     for effect in &clip.effects {
@@ -1480,6 +1733,7 @@ fn audio_effects(clip: &Clip, timebase: Rational) -> Result<String, MediaError> 
                     (clip_duration - fade).max(0.0)
                 ));
             }
+            _ if ignore_visual_effects => {}
             _ => {
                 return Err(MediaError::Unsupported(
                     "audio layer contains an unsupported effect".into(),
@@ -1657,16 +1911,7 @@ pub trait ChildProcessRunner {
 pub struct SystemChildProcessRunner;
 impl ChildProcessRunner for SystemChildProcessRunner {
     fn run(&self, executable: &Path, argv: &[String]) -> Result<ProcessOutput, MediaError> {
-        let output = Command::new(executable)
-            .args(argv)
-            .stdin(Stdio::null())
-            .output()
-            .map_err(MediaError::Io)?;
-        Ok(ProcessOutput {
-            status_code: output.status.code(),
-            stdout: output.stdout,
-            stderr: output.stderr,
-        })
+        run_cancellable(executable, argv, &|| false)
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1999,6 +2244,7 @@ fn parse_progress(stdout: &[u8]) -> Vec<ProgressEvent> {
                 value: value.to_owned(),
             })
         })
+        .take(MAX_PROGRESS_EVENTS)
         .collect()
 }
 fn run_cancellable(
@@ -2013,27 +2259,52 @@ fn run_cancellable(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(MediaError::Io)?;
-    let stdout = child.stdout.take().ok_or_else(|| {
-        MediaError::InvalidConfiguration("FFmpeg stdout pipe was not created".into())
-    })?;
-    let stderr = child.stderr.take().ok_or_else(|| {
-        MediaError::InvalidConfiguration("FFmpeg stderr pipe was not created".into())
-    })?;
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(MediaError::InvalidConfiguration(
+                "FFmpeg stdout pipe was not created".into(),
+            ));
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(MediaError::InvalidConfiguration(
+                "FFmpeg stderr pipe was not created".into(),
+            ));
+        }
+    };
     let stdout_thread = thread::spawn(move || read_pipe(stdout));
     let stderr_thread = thread::spawn(move || read_pipe(stderr));
-    let status = wait_cancellable(&mut child, cancelled)?;
-    let stdout = stdout_thread
-        .join()
-        .map_err(|_| MediaError::ProcessFailed {
+    let status = match wait_cancellable(&mut child, cancelled) {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = stdout_thread.join();
+            let _ = stderr_thread.join();
+            return Err(error);
+        }
+    };
+    let stdout_result = match stdout_thread.join() {
+        Ok(result) => result.map_err(MediaError::Io),
+        Err(_) => Err(MediaError::ProcessFailed {
             code: status.code(),
             stderr: "FFmpeg stdout reader failed".into(),
-        })??;
-    let stderr = stderr_thread
-        .join()
-        .map_err(|_| MediaError::ProcessFailed {
+        }),
+    };
+    let stderr_result = match stderr_thread.join() {
+        Ok(result) => result.map_err(MediaError::Io),
+        Err(_) => Err(MediaError::ProcessFailed {
             code: status.code(),
             stderr: "FFmpeg stderr reader failed".into(),
-        })??;
+        }),
+    };
+    let stdout = stdout_result?;
+    let stderr = stderr_result?;
     Ok(ProcessOutput {
         status_code: status.code(),
         stdout,
@@ -2041,8 +2312,17 @@ fn run_cancellable(
     })
 }
 fn read_pipe(mut pipe: impl Read) -> io::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    pipe.read_to_end(&mut bytes)?;
+    let mut bytes = Vec::with_capacity(8 * 1024);
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let count = pipe.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        let remaining = MAX_PROCESS_OUTPUT_BYTES.saturating_sub(bytes.len());
+        let keep = remaining.min(count);
+        bytes.extend_from_slice(&buffer[..keep]);
+    }
     Ok(bytes)
 }
 fn wait_cancellable(
@@ -2055,8 +2335,14 @@ fn wait_cancellable(
             let _ = child.wait();
             return Err(MediaError::Cancelled);
         }
-        if let Some(status) = child.try_wait().map_err(MediaError::Io)? {
-            return Ok(status);
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(MediaError::Io(error));
+            }
         }
         thread::sleep(Duration::from_millis(20));
     }
@@ -2246,8 +2532,9 @@ impl From<io::Error> for MediaError {
 mod tests {
     use super::*;
     use editor_domain::{
-        Asset, AudioStream, Clip, Fingerprint, ProbeSummary, ProjectId, Track, Transform,
-        VideoStream,
+        Asset, AssetId, AssetKind, AssetStatus, AudioStream, Clip, Effect, Fingerprint,
+        ProbeSummary, ProjectId, RelativePath, RgbColor, RgbDelta, TextOverlay, Track, TrackId,
+        TrackKind, Transform, VideoStream,
     };
     use std::time::{SystemTime, UNIX_EPOCH};
     fn temp_dir() -> PathBuf {
@@ -2306,6 +2593,7 @@ mod tests {
             transform: Transform::default(),
             effects: vec![],
             keyframes: vec![],
+            text_overlay: None,
         };
         let mut track = Track::new(
             editor_domain::TrackId::new("video").unwrap(),
@@ -2330,6 +2618,12 @@ mod tests {
             parse_probe_json(&json.replace("\"duration\":\"2.5\"", "\"duration\":\"NaN\""))
                 .is_err()
         );
+    }
+    #[test]
+    fn process_output_is_bounded_without_stopping_pipe_drain() {
+        let input = vec![7_u8; MAX_PROCESS_OUTPUT_BYTES + 1];
+        let output = read_pipe(std::io::Cursor::new(input)).unwrap();
+        assert_eq!(output.len(), MAX_PROCESS_OUTPUT_BYTES);
     }
     #[test]
     fn plan_uses_asset_timebase_and_requires_concat_compatibility() {
@@ -2429,6 +2723,7 @@ mod tests {
             transform: Transform::default(),
             effects: Vec::new(),
             keyframes: Vec::new(),
+            text_overlay: None,
         });
         let mut music = Track::new(
             editor_domain::TrackId::new("music").unwrap(),
@@ -2455,6 +2750,7 @@ mod tests {
             transform: Transform::default(),
             effects: Vec::new(),
             keyframes: Vec::new(),
+            text_overlay: None,
         });
         doc.sequence.tracks.push(voice);
         doc.sequence.tracks.push(music);
@@ -2474,6 +2770,150 @@ mod tests {
             plan.expected_output.stream_kinds,
             vec![StreamKind::Video, StreamKind::Audio]
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn layered_plan_maps_effects_transforms_overlays_and_text_to_ffmpeg_filters() {
+        let root = temp_dir();
+        let mut doc = document(&root, Rational::new(30, 1).unwrap(), "h264");
+        fs::create_dir_all(root.join("looks")).unwrap();
+        fs::write(
+            root.join("looks/warm.cube"),
+            "TITLE \"warm\"\nLUT_3D_SIZE 2\n",
+        )
+        .unwrap();
+
+        let clip = &mut doc.sequence.tracks[0].clips[0];
+        clip.opacity = 0.8;
+        clip.transform = Transform {
+            position_x: 0.2,
+            position_y: -0.1,
+            scale_x: 1.1,
+            scale_y: 0.9,
+            rotation_degrees: 5.0,
+            anchor_x: 0.5,
+            anchor_y: 0.5,
+        };
+        clip.effects = vec![
+            Effect::Exposure { value: 0.4 },
+            Effect::Gamma { value: 1.1 },
+            Effect::Temperature { kelvin: 6_500.0 },
+            Effect::Tint { value: 0.1 },
+            Effect::ColorBalance {
+                shadows: RgbDelta {
+                    red: 0.1,
+                    green: 0.0,
+                    blue: -0.1,
+                },
+                midtones: RgbDelta {
+                    red: 0.0,
+                    green: 0.1,
+                    blue: 0.0,
+                },
+                highlights: RgbDelta {
+                    red: 0.1,
+                    green: 0.1,
+                    blue: 0.0,
+                },
+            },
+            Effect::Blur { radius: 2.0 },
+            Effect::Sharpen { amount: 0.5 },
+            Effect::Vignette { amount: 0.4 },
+            Effect::Duotone {
+                shadows: RgbColor {
+                    red: 10,
+                    green: 20,
+                    blue: 40,
+                },
+                highlights: RgbColor {
+                    red: 240,
+                    green: 220,
+                    blue: 180,
+                },
+            },
+            Effect::Lut {
+                relative_path: RelativePath::new("looks/warm.cube").unwrap(),
+            },
+        ];
+
+        let mut overlay = Track::new(
+            TrackId::new("overlay").unwrap(),
+            TrackKind::Overlay,
+            "Overlay",
+        )
+        .unwrap();
+        let mut overlay_clip = doc.sequence.tracks[0].clips[1].clone();
+        overlay_clip.id = editor_domain::ClipId::new("overlay-clip").unwrap();
+        overlay_clip.timeline_start = 15;
+        overlay_clip.opacity = 0.65;
+        overlay.clips.push(overlay_clip);
+        doc.sequence.tracks.push(overlay);
+
+        let text_asset_id = AssetId::new("title-asset").unwrap();
+        doc.assets.push(Asset {
+            id: text_asset_id.clone(),
+            relative_path: RelativePath::new("generated/title.title").unwrap(),
+            kind: AssetKind::Text,
+            fingerprint: Fingerprint {
+                size_bytes: 11,
+                modified_time: "generated".into(),
+                sha256: None,
+            },
+            probe: None,
+            status: AssetStatus::Available,
+        });
+        let mut text = Track::new(TrackId::new("text").unwrap(), TrackKind::Text, "Text").unwrap();
+        text.clips.push(Clip {
+            id: editor_domain::ClipId::new("title-clip").unwrap(),
+            asset_id: text_asset_id,
+            timeline_start: 15,
+            timeline_duration: 30,
+            source_start: 0,
+            source_duration: 30,
+            speed: Rational::new(1, 1).unwrap(),
+            opacity: 1.0,
+            transform: Transform::default(),
+            effects: Vec::new(),
+            keyframes: Vec::new(),
+            text_overlay: Some(TextOverlay {
+                text: "Hello: editor".into(),
+                font_size: 44.0,
+                color: "#FFCC00".into(),
+                position_x: 0.0,
+                position_y: 0.75,
+            }),
+        });
+        doc.sequence.tracks.push(text);
+
+        let plan = build_render_plan_with_profile(
+            &doc,
+            &root,
+            root.join("effects.mp4"),
+            &ExecutableConfig::new(root.join("ffmpeg.exe"), root.join("ffprobe.exe")),
+            ExportProfile::Instagram,
+        )
+        .unwrap();
+        let graph = &plan.step.filter_complex;
+        for expected in [
+            "exposure=",
+            "gamma=",
+            "colortemperature=",
+            "colorbalance=",
+            "gblur=",
+            "unsharp=",
+            "vignette=",
+            "lutrgb=",
+            "lut3d=",
+            "colorchannelmixer=aa=",
+            "drawtext=",
+        ] {
+            assert!(graph.contains(expected), "missing {expected} in {graph}");
+        }
+        assert!(graph.contains("overlay=x='"));
+        assert!(graph.contains("scale=iw*1.100000:ih*0.900000"));
+        assert_eq!(plan.expected_output.width, 1080);
+        assert_eq!(plan.expected_output.height, 1920);
         fs::remove_dir_all(root).unwrap();
     }
 

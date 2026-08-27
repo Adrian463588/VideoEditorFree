@@ -17,8 +17,12 @@ is a typed projection over host commands.
 ## What is implemented
 
 - Integer-tick timeline IR with rational timebases and half-open ranges.
-- Typed trim, split, reorder, delete, ripple-delete, relink, markers, track
-  state, effects, and revision-conflict operations.
+- Multi-track video, audio, text, and overlay lanes with drag/drop placement,
+  magnetic snapping, typed trim, split, move, reorder, delete, ripple-delete,
+  relink, markers, track state, effects, and revision-conflict operations.
+- CPU video effects for exposure, gamma, temperature/tint, contrast, saturation,
+  three-way color balance, crop, rotate, blur, sharpen, vignette, duotone, and
+  project-relative `.cube` LUTs, plus opacity, transforms, and audio fades.
 - Versioned `.vdeproj` persistence with relative asset paths, atomic saves,
   backup/recovery, and path containment checks.
 - Fixed-argv FFmpeg/ffprobe planning, probe validation, cancellation, output
@@ -27,7 +31,15 @@ is a typed projection over host commands.
   YouTube, Instagram Reels, and TikTok presets.
 - Local multilingual Whisper subtitle generation with editable timestamped
   cues when the explicit Subtitle AI bundle is installed.
+- Local Piper voiceover generation with a verified `en_US-lessac-medium` voice,
+  inserted as a real audio asset and timeline clip when the AI bundle is
+  installed.
+- Reviewable local LLM edit plans using the provisioned Qwen GGUF runtime;
+  typed timeline operations and color-grade presets require explicit apply.
 - Job registry with snapshots, progress, cancellation, and failure envelopes.
+- Bounded subprocess lifecycle: one local AI process at a time, fixed llama
+  context/threads, 90-second planner timeout, capped model/media diagnostics,
+  drained pipes, and in-flight host-status polling.
 - Typed local-AI model/readiness and edit-plan contracts; model output cannot
   mutate a project without validation and confirmation.
 - Native Tauri open/import dialogs with least-privilege capabilities.
@@ -43,7 +55,7 @@ allowlisted Windows x64 artifacts to
 declared size and SHA-256, then extracts only the required runtime files.
 
 In the desktop app, choose **Download bundle** to provision the `core` media
-profile (FFmpeg/ffprobe) required for import, preview, and export. From a
+profile (FFmpeg/ffprobe) required for import and export. From a
 Windows development checkout, the equivalent command is:
 
 ```powershell
@@ -69,6 +81,12 @@ The latest GitHub release also contains a small bootstrap ZIP with the script
 and manifest only. It does not contain the large third-party binaries/models;
 those remain upstream downloads and are installed only after checksum
 verification.
+
+The current correctness path is CPU-based. A native GPU backend is not claimed
+until it has a reviewed implementation and measured acceptance evidence. The
+preview transport also remains fail-closed until a reviewed playback backend is
+provisioned; import, timeline editing, local AI generation, and export do not
+silently fabricate unavailable results.
 
 ## Development
 
@@ -101,3 +119,8 @@ silently install third-party assets or claim runtime acceptance from a filename.
 
 Read the contracts and traceability in
 [`PRD.md`](PRD.md), [`DESIGN.md`](DESIGN.md), and [`AGENTS.md`](AGENTS.md).
+
+Implementation references: [FFmpeg filters](https://ffmpeg.org/ffmpeg-filters.html),
+[whisper.cpp CLI](https://github.com/ggml-org/whisper.cpp/blob/master/examples/cli/README.md),
+[Piper](https://github.com/rhasspy/piper/blob/master/README.md), and
+[llama.cpp CLI](https://github.com/ggml-org/llama.cpp/blob/master/tools/cli/README.md).

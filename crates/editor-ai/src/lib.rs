@@ -4,7 +4,8 @@
 //! infer transcripts, execute commands, access paths, or mutate projects.
 
 use editor_domain::{
-    AssetId, ClipId, DomainError, ProjectDocument, ProjectId, TickRange, TimelineOperation, TrackId,
+    AssetId, ClipId, DomainError, Effect, ProjectDocument, ProjectId, TickRange, TimelineOperation,
+    TrackId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -853,6 +854,44 @@ impl fmt::Display for TranscriptError {
 
 impl Error for TranscriptError {}
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum EffectPreset {
+    WarmColorGrade,
+    CoolColorGrade,
+    Monochrome,
+}
+
+impl EffectPreset {
+    fn parse(value: &str) -> Result<Self, PlanError> {
+        match value {
+            "warm_color_grade" => Ok(Self::WarmColorGrade),
+            "cool_color_grade" => Ok(Self::CoolColorGrade),
+            "monochrome" => Ok(Self::Monochrome),
+            _ => Err(PlanError::InvalidOperation(format!(
+                "unknown effect preset: {value}"
+            ))),
+        }
+    }
+
+    fn effects(self) -> Vec<Effect> {
+        match self {
+            Self::WarmColorGrade => vec![
+                Effect::Temperature { kelvin: 4_500.0 },
+                Effect::Tint { value: 0.08 },
+                Effect::Saturation { value: 1.1 },
+                Effect::Contrast { value: 1.05 },
+            ],
+            Self::CoolColorGrade => vec![
+                Effect::Temperature { kelvin: 8_500.0 },
+                Effect::Tint { value: -0.08 },
+                Effect::Saturation { value: 1.05 },
+                Effect::Contrast { value: 1.05 },
+            ],
+            Self::Monochrome => vec![Effect::Saturation { value: 0.0 }],
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub enum PlanOperation {
     Trim {
@@ -874,6 +913,10 @@ pub enum PlanOperation {
         track_id: TrackId,
         clip_id: ClipId,
         new_index: usize,
+    },
+    EffectPreset {
+        clip_id: ClipId,
+        preset: EffectPreset,
     },
 }
 
@@ -910,6 +953,7 @@ impl PlanOperation {
                 track_id.validate().map_err(PlanError::Domain)?;
                 clip_id.validate().map_err(PlanError::Domain)
             }
+            Self::EffectPreset { clip_id, .. } => clip_id.validate().map_err(PlanError::Domain),
         }
     }
 
@@ -946,6 +990,10 @@ impl PlanOperation {
                 clip_id: clip_id.clone(),
                 new_index: *new_index,
             },
+            Self::EffectPreset { clip_id, preset } => TimelineOperation::SetClipEffects {
+                clip_id: clip_id.clone(),
+                effects: preset.effects(),
+            },
         }
     }
 
@@ -955,7 +1003,8 @@ impl PlanOperation {
             | Self::Split { clip_id, .. }
             | Self::Delete { clip_id }
             | Self::RippleDelete { clip_id, .. }
-            | Self::Reorder { clip_id, .. } => clip_id,
+            | Self::Reorder { clip_id, .. }
+            | Self::EffectPreset { clip_id, .. } => clip_id,
         }
     }
 }
@@ -1275,6 +1324,17 @@ fn parse_operation(value: &Value) -> Result<PlanOperation, PlanError> {
                 track_id: parse_id(object, "track_id", TrackId::new)?,
                 clip_id: parse_id(object, "clip_id", ClipId::new)?,
                 new_index,
+            })
+        }
+        "effect_preset" => {
+            reject_unknown_keys(object, &["op", "clip_id", "preset"])?;
+            let preset = object
+                .get("preset")
+                .and_then(Value::as_str)
+                .ok_or_else(|| PlanError::Malformed("preset must be a string".into()))?;
+            Ok(PlanOperation::EffectPreset {
+                clip_id: parse_id(object, "clip_id", ClipId::new)?,
+                preset: EffectPreset::parse(preset)?,
             })
         }
         "shell" | "execute" | "run_command" | "filtergraph" | "path" | "download" | "network" => {
@@ -1698,6 +1758,7 @@ mod tests {
             transform: Transform::default(),
             effects: Vec::new(),
             keyframes: Vec::new(),
+            text_overlay: None,
         });
         project.sequence = Sequence {
             tracks: vec![track],
@@ -1837,6 +1898,22 @@ mod tests {
                 source_end: 8,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn effect_preset_plan_maps_to_typed_color_operations() {
+        let plan = parse_edit_plan_json(&plan_json(
+            r#"{"op":"effect_preset","clip_id":"clip-1","preset":"warm_color_grade"}"#,
+        ))
+        .unwrap();
+        let validated = validate_plan_for_apply(&project(), &plan, true).unwrap();
+        let TimelineOperation::SetClipEffects { effects, .. } = &validated.operations()[0] else {
+            panic!("effect preset must become a typed effect operation");
+        };
+        assert!(matches!(
+            effects.first(),
+            Some(Effect::Temperature { kelvin }) if (*kelvin - 4_500.0).abs() < f32::EPSILON
         ));
     }
 

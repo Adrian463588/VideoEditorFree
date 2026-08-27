@@ -289,6 +289,7 @@ pub enum AssetKind {
     Audio,
     Image,
     Subtitle,
+    Text,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -437,6 +438,8 @@ pub enum TrackKind {
     Video,
     Audio,
     Subtitle,
+    Text,
+    Overlay,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -444,6 +447,47 @@ pub struct RgbDelta {
     pub red: f32,
     pub green: f32,
     pub blue: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RgbColor {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TextOverlay {
+    pub text: String,
+    pub font_size: f32,
+    pub color: String,
+    pub position_x: f32,
+    pub position_y: f32,
+}
+
+impl TextOverlay {
+    fn validate(&self) -> Result<(), DomainError> {
+        if self.text.trim().is_empty() || self.text.len() > 4_096 || self.text.contains('\0') {
+            return Err(invalid(
+                "text_overlay.text",
+                "must contain 1..=4096 non-NUL bytes",
+            ));
+        }
+        finite_between("text_overlay.font_size", self.font_size, 8.0, 512.0)?;
+        let valid_color = matches!(self.color.len(), 7 | 9)
+            && self.color.starts_with('#')
+            && self.color[1..]
+                .chars()
+                .all(|value| value.is_ascii_hexdigit());
+        if !valid_color {
+            return Err(invalid(
+                "text_overlay.color",
+                "must be #RRGGBB or #RRGGBBAA",
+            ));
+        }
+        finite_between("text_overlay.position_x", self.position_x, -1.0, 1.0)?;
+        finite_between("text_overlay.position_y", self.position_y, -1.0, 1.0)
+    }
 }
 
 impl RgbDelta {
@@ -495,6 +539,18 @@ pub enum Effect {
     Saturation {
         value: f32,
     },
+    Exposure {
+        value: f32,
+    },
+    Gamma {
+        value: f32,
+    },
+    Temperature {
+        kelvin: f32,
+    },
+    Tint {
+        value: f32,
+    },
     ColorBalance {
         shadows: RgbDelta,
         midtones: RgbDelta,
@@ -508,6 +564,22 @@ pub enum Effect {
     },
     Rotate {
         degrees: i16,
+    },
+    Blur {
+        radius: f32,
+    },
+    Sharpen {
+        amount: f32,
+    },
+    Vignette {
+        amount: f32,
+    },
+    Duotone {
+        shadows: RgbColor,
+        highlights: RgbColor,
+    },
+    Lut {
+        relative_path: RelativePath,
     },
     Speed {
         factor: Rational,
@@ -528,6 +600,12 @@ impl Effect {
             Self::Brightness { value } => finite_between("effect.brightness", *value, -1.0, 1.0),
             Self::Contrast { value } => finite_between("effect.contrast", *value, 0.0, 4.0),
             Self::Saturation { value } => finite_between("effect.saturation", *value, 0.0, 4.0),
+            Self::Exposure { value } => finite_between("effect.exposure", *value, -10.0, 10.0),
+            Self::Gamma { value } => finite_between("effect.gamma", *value, 0.1, 10.0),
+            Self::Temperature { kelvin } => {
+                finite_between("effect.temperature.kelvin", *kelvin, 1_000.0, 40_000.0)
+            }
+            Self::Tint { value } => finite_between("effect.tint", *value, -1.0, 1.0),
             Self::ColorBalance {
                 shadows,
                 midtones,
@@ -556,6 +634,13 @@ impl Effect {
                 Ok(())
             }
             Self::Rotate { .. } => Ok(()),
+            Self::Blur { radius } => finite_between("effect.blur.radius", *radius, 0.1, 100.0),
+            Self::Sharpen { amount } => finite_between("effect.sharpen.amount", *amount, 0.0, 10.0),
+            Self::Vignette { amount } => {
+                finite_between("effect.vignette.amount", *amount, 0.0, 1.0)
+            }
+            Self::Duotone { .. } => Ok(()),
+            Self::Lut { relative_path } => relative_path.validate(),
             Self::Speed { factor, .. } => factor.validate(),
             Self::Volume { gain_db } => {
                 finite_between("effect.volume.gain_db", *gain_db, -120.0, 24.0)
@@ -684,6 +769,8 @@ pub struct Clip {
     pub transform: Transform,
     pub effects: Vec<Effect>,
     pub keyframes: Vec<Keyframe>,
+    #[serde(default)]
+    pub text_overlay: Option<TextOverlay>,
 }
 
 impl Clip {
@@ -713,6 +800,22 @@ impl Clip {
             ));
         }
         self.transform.validate()?;
+        match (&asset.kind, &self.text_overlay) {
+            (AssetKind::Text, Some(text_overlay)) => text_overlay.validate()?,
+            (AssetKind::Text, None) => {
+                return Err(invalid(
+                    "clip.text_overlay",
+                    "text assets require text overlay content",
+                ))
+            }
+            (_, Some(_)) => {
+                return Err(invalid(
+                    "clip.text_overlay",
+                    "text overlay content requires a text asset",
+                ))
+            }
+            (_, None) => {}
+        }
         for effect in &self.effects {
             effect.validate()?;
         }
@@ -812,6 +915,8 @@ fn track_accepts_asset(track: &TrackKind, asset: &AssetKind) -> bool {
         TrackKind::Video => matches!(asset, AssetKind::Video | AssetKind::Image),
         TrackKind::Audio => matches!(asset, AssetKind::Video | AssetKind::Audio),
         TrackKind::Subtitle => matches!(asset, AssetKind::Subtitle),
+        TrackKind::Text => matches!(asset, AssetKind::Text),
+        TrackKind::Overlay => matches!(asset, AssetKind::Video | AssetKind::Image),
     }
 }
 
@@ -1130,6 +1235,11 @@ pub enum TimelineOperation {
         clip_id: ClipId,
         timeline_start: i64,
     },
+    MoveClipToTrack {
+        clip_id: ClipId,
+        track_id: TrackId,
+        timeline_start: i64,
+    },
     TrimClip {
         clip_id: ClipId,
         source_start: i64,
@@ -1150,6 +1260,15 @@ pub enum TimelineOperation {
     RippleDelete {
         track_id: TrackId,
         clip_id: ClipId,
+    },
+    SetClipEffects {
+        clip_id: ClipId,
+        effects: Vec<Effect>,
+    },
+    SetClipVisuals {
+        clip_id: ClipId,
+        opacity: f32,
+        transform: Transform,
     },
     AddMarker {
         marker: Marker,
@@ -1414,6 +1533,83 @@ fn apply_operation(
             }
             track.clips[clip_index].timeline_start = timeline_start;
         }
+        TimelineOperation::MoveClipToTrack {
+            clip_id,
+            track_id,
+            timeline_start,
+        } => {
+            if timeline_start < 0 {
+                return Err(invalid("move.timeline_start", "must not be negative"));
+            }
+            let (source_track_index, clip_index) = find_clip_position(project, &clip_id)?;
+            let target_track_index = project
+                .sequence
+                .tracks
+                .iter()
+                .position(|track| track.id == track_id)
+                .ok_or_else(|| DomainError::NotFound {
+                    entity: "track".to_owned(),
+                    id: track_id.to_string(),
+                })?;
+            if source_track_index == target_track_index {
+                return apply_operation(
+                    project,
+                    TimelineOperation::MoveClip {
+                        clip_id,
+                        timeline_start,
+                    },
+                    next_revision,
+                );
+            }
+            if project.sequence.tracks[source_track_index].locked {
+                return Err(DomainError::Locked {
+                    entity: "track".to_owned(),
+                    id: project.sequence.tracks[source_track_index].id.to_string(),
+                });
+            }
+            if project.sequence.tracks[target_track_index].locked {
+                return Err(DomainError::Locked {
+                    entity: "track".to_owned(),
+                    id: project.sequence.tracks[target_track_index].id.to_string(),
+                });
+            }
+            let clip = project.sequence.tracks[source_track_index].clips[clip_index].clone();
+            let asset = project
+                .assets
+                .iter()
+                .find(|asset| asset.id == clip.asset_id)
+                .ok_or_else(|| DomainError::NotFound {
+                    entity: "asset".to_owned(),
+                    id: clip.asset_id.to_string(),
+                })?;
+            let target = &project.sequence.tracks[target_track_index];
+            if !track_accepts_asset(&target.kind, &asset.kind) {
+                return Err(DomainError::AssetKindMismatch {
+                    track: target.kind.clone(),
+                    asset: asset.kind.clone(),
+                });
+            }
+            let new_range = TickRange::from_duration(timeline_start, clip.timeline_duration)?;
+            if let Some(overlap) = target.clips.iter().find(|other| {
+                other
+                    .timeline_range()
+                    .is_ok_and(|other_range| new_range.overlaps(other_range))
+            }) {
+                return Err(DomainError::Overlap {
+                    track_id,
+                    first: overlap.id.clone(),
+                    second: clip_id,
+                });
+            }
+            let mut moved = project.sequence.tracks[source_track_index]
+                .clips
+                .remove(clip_index);
+            moved.timeline_start = timeline_start;
+            moved.validate(asset)?;
+            project.sequence.tracks[target_track_index]
+                .clips
+                .push(moved);
+        }
         TimelineOperation::TrimClip {
             clip_id,
             source_start,
@@ -1585,6 +1781,58 @@ fn apply_operation(
                     marker.clip_id = None;
                 }
             }
+        }
+        TimelineOperation::SetClipEffects { clip_id, effects } => {
+            let (track_index, clip_index) = find_clip_position(project, &clip_id)?;
+            let track = &mut project.sequence.tracks[track_index];
+            if track.locked {
+                return Err(DomainError::Locked {
+                    entity: "track".to_owned(),
+                    id: track.id.to_string(),
+                });
+            }
+            for effect in &effects {
+                effect.validate()?;
+            }
+            let asset = project
+                .assets
+                .iter()
+                .find(|asset| asset.id == track.clips[clip_index].asset_id)
+                .ok_or_else(|| DomainError::NotFound {
+                    entity: "asset".to_owned(),
+                    id: track.clips[clip_index].asset_id.to_string(),
+                })?;
+            let mut candidate = track.clips[clip_index].clone();
+            candidate.effects = effects;
+            candidate.validate(asset)?;
+            track.clips[clip_index] = candidate;
+        }
+        TimelineOperation::SetClipVisuals {
+            clip_id,
+            opacity,
+            transform,
+        } => {
+            let (track_index, clip_index) = find_clip_position(project, &clip_id)?;
+            let track = &mut project.sequence.tracks[track_index];
+            if track.locked {
+                return Err(DomainError::Locked {
+                    entity: "track".to_owned(),
+                    id: track.id.to_string(),
+                });
+            }
+            let asset = project
+                .assets
+                .iter()
+                .find(|asset| asset.id == track.clips[clip_index].asset_id)
+                .ok_or_else(|| DomainError::NotFound {
+                    entity: "asset".to_owned(),
+                    id: track.clips[clip_index].asset_id.to_string(),
+                })?;
+            let mut candidate = track.clips[clip_index].clone();
+            candidate.opacity = opacity;
+            candidate.transform = transform;
+            candidate.validate(asset)?;
+            track.clips[clip_index] = candidate;
         }
         TimelineOperation::AddMarker { marker } => {
             if project
@@ -1807,6 +2055,7 @@ mod tests {
             transform: Transform::default(),
             effects: Vec::new(),
             keyframes: Vec::new(),
+            text_overlay: None,
         }
     }
 
@@ -2264,5 +2513,186 @@ mod tests {
             preserve_pitch: false,
         };
         assert!(speed.validate().is_err());
+    }
+
+    #[test]
+    fn layered_operations_support_overlay_effects_visuals_and_text_tracks() {
+        let (mut project, video_track_id, asset_id) = project_with_track();
+        let video_clip = clip("clip-1", asset_id.clone(), 0);
+        project = project
+            .apply(
+                0,
+                TimelineOperation::AddClip {
+                    track_id: video_track_id,
+                    clip: video_clip,
+                },
+            )
+            .unwrap()
+            .document;
+
+        let overlay_track_id = id(TrackId::new, "overlay-1");
+        project = project
+            .apply(
+                1,
+                TimelineOperation::AddTrack {
+                    track: Track::new(overlay_track_id.clone(), TrackKind::Overlay, "Overlay")
+                        .unwrap(),
+                },
+            )
+            .unwrap()
+            .document;
+        project = project
+            .apply(
+                2,
+                TimelineOperation::MoveClipToTrack {
+                    clip_id: id(ClipId::new, "clip-1"),
+                    track_id: overlay_track_id.clone(),
+                    timeline_start: 15,
+                },
+            )
+            .unwrap()
+            .document;
+        project = project
+            .apply(
+                3,
+                TimelineOperation::SetClipEffects {
+                    clip_id: id(ClipId::new, "clip-1"),
+                    effects: vec![
+                        Effect::Exposure { value: 0.5 },
+                        Effect::Gamma { value: 1.1 },
+                        Effect::Temperature { kelvin: 6_500.0 },
+                        Effect::Tint { value: 0.1 },
+                        Effect::ColorBalance {
+                            shadows: RgbDelta {
+                                red: 0.1,
+                                green: 0.0,
+                                blue: -0.1,
+                            },
+                            midtones: RgbDelta {
+                                red: 0.0,
+                                green: 0.1,
+                                blue: 0.0,
+                            },
+                            highlights: RgbDelta {
+                                red: 0.1,
+                                green: 0.1,
+                                blue: 0.0,
+                            },
+                        },
+                        Effect::Blur { radius: 2.0 },
+                        Effect::Sharpen { amount: 0.5 },
+                        Effect::Vignette { amount: 0.4 },
+                        Effect::Duotone {
+                            shadows: RgbColor {
+                                red: 12,
+                                green: 20,
+                                blue: 45,
+                            },
+                            highlights: RgbColor {
+                                red: 240,
+                                green: 220,
+                                blue: 180,
+                            },
+                        },
+                        Effect::Lut {
+                            relative_path: RelativePath::new("looks/warm.cube").unwrap(),
+                        },
+                    ],
+                },
+            )
+            .unwrap()
+            .document;
+        project = project
+            .apply(
+                4,
+                TimelineOperation::SetClipVisuals {
+                    clip_id: id(ClipId::new, "clip-1"),
+                    opacity: 0.75,
+                    transform: Transform {
+                        position_x: 0.2,
+                        position_y: -0.1,
+                        scale_x: 1.1,
+                        scale_y: 0.9,
+                        rotation_degrees: 8.0,
+                        anchor_x: 0.5,
+                        anchor_y: 0.5,
+                    },
+                },
+            )
+            .unwrap()
+            .document;
+
+        let text_asset_id = id(AssetId::new, "title-asset");
+        project = project
+            .apply(
+                5,
+                TimelineOperation::AddAsset {
+                    asset: Asset {
+                        id: text_asset_id.clone(),
+                        relative_path: RelativePath::new("generated/title.title").unwrap(),
+                        kind: AssetKind::Text,
+                        fingerprint: Fingerprint {
+                            size_bytes: 5,
+                            modified_time: "generated".to_owned(),
+                            sha256: None,
+                        },
+                        probe: None,
+                        status: AssetStatus::Available,
+                    },
+                },
+            )
+            .unwrap()
+            .document;
+        let text_track_id = id(TrackId::new, "text-1");
+        project = project
+            .apply(
+                6,
+                TimelineOperation::AddTrack {
+                    track: Track::new(text_track_id.clone(), TrackKind::Text, "Text").unwrap(),
+                },
+            )
+            .unwrap()
+            .document;
+        project = project
+            .apply(
+                7,
+                TimelineOperation::AddClip {
+                    track_id: text_track_id,
+                    clip: Clip {
+                        id: id(ClipId::new, "title-clip"),
+                        asset_id: text_asset_id,
+                        timeline_start: 20,
+                        timeline_duration: 60,
+                        source_start: 0,
+                        source_duration: 60,
+                        speed: Rational::new(1, 1).unwrap(),
+                        opacity: 1.0,
+                        transform: Transform::default(),
+                        effects: Vec::new(),
+                        keyframes: Vec::new(),
+                        text_overlay: Some(TextOverlay {
+                            text: "Hello world".to_owned(),
+                            font_size: 48.0,
+                            color: "#FFFFFF".to_owned(),
+                            position_x: 0.0,
+                            position_y: 0.8,
+                        }),
+                    },
+                },
+            )
+            .unwrap()
+            .document;
+
+        assert_eq!(project.revision, 8);
+        assert_eq!(project.sequence.tracks[1].kind, TrackKind::Overlay);
+        assert_eq!(project.sequence.tracks[1].clips[0].opacity, 0.75);
+        assert_eq!(project.sequence.tracks[1].clips[0].effects.len(), 10);
+        assert!(project
+            .sequence
+            .tracks
+            .iter()
+            .find(|track| track.kind == TrackKind::Text)
+            .is_some_and(|track| track.clips[0].text_overlay.is_some()));
+        project.validate().unwrap();
     }
 }

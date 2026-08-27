@@ -1,8 +1,8 @@
 export type CapabilityState = "READY" | "BLOCKED" | "UNAVAILABLE";
 
-export type AssetKind = "Video" | "Audio" | "Image" | "Subtitle";
+export type AssetKind = "Video" | "Audio" | "Image" | "Subtitle" | "Text";
 export type AssetStatus = "Available" | "Missing" | "Unsupported" | "Invalid";
-export type TrackKind = "Video" | "Audio" | "Subtitle";
+export type TrackKind = "Video" | "Audio" | "Subtitle" | "Text" | "Overlay";
 export type ExportProfile = "youtube" | "instagram" | "tiktok";
 
 export interface Rational {
@@ -55,6 +55,7 @@ export interface ProjectClip {
   transform: Transform;
   effects: Effect[];
   keyframes: Keyframe[];
+  text_overlay: TextOverlay | null;
 }
 
 export interface Transform {
@@ -71,14 +72,31 @@ export type Effect =
   | { Brightness: { value: number } }
   | { Contrast: { value: number } }
   | { Saturation: { value: number } }
+  | { Exposure: { value: number } }
+  | { Gamma: { value: number } }
+  | { Temperature: { kelvin: number } }
+  | { Tint: { value: number } }
   | { ColorBalance: { shadows: RgbDelta; midtones: RgbDelta; highlights: RgbDelta } }
   | { Crop: { left: number; top: number; right: number; bottom: number } }
   | { Rotate: { degrees: number } }
+  | { Blur: { radius: number } }
+  | { Sharpen: { amount: number } }
+  | { Vignette: { amount: number } }
+  | { Duotone: { shadows: RgbColor; highlights: RgbColor } }
+  | { Lut: { relative_path: string } }
   | { Speed: { factor: Rational; preserve_pitch: boolean } }
   | { Volume: { gain_db: number } }
   | { Fade: { kind: "In" | "Out"; duration_ticks: number } };
 
 export interface RgbDelta { red: number; green: number; blue: number }
+export interface RgbColor { red: number; green: number; blue: number }
+export interface TextOverlay {
+  text: string;
+  font_size: number;
+  color: string;
+  position_x: number;
+  position_y: number;
+}
 export type KeyframeProperty = "Opacity" | "PositionX" | "PositionY" | "ScaleX" | "ScaleY" | "Rotation";
 export type KeyframeValue = { Scalar: { value: number } } | { Point: { x: number; y: number } };
 export interface Keyframe { at_tick: number; property: KeyframeProperty; value: KeyframeValue }
@@ -165,6 +183,8 @@ export interface EditorSnapshot {
     mediaRuntime: CapabilityState;
     assistant: ModelCapability;
     subtitles: ModelCapability;
+    tts: ModelCapability;
+    effects: HostCapabilityStatus;
     audioDucking: HostCapabilityStatus;
     exportProfiles: HostCapabilityStatus;
   };
@@ -182,6 +202,8 @@ export interface HostStatus {
   media: HostCapabilityStatus;
   ai: HostCapabilityStatus;
   subtitles?: HostCapabilityStatus;
+  tts?: HostCapabilityStatus;
+  effects?: HostCapabilityStatus;
   audioDucking?: HostCapabilityStatus;
   exportProfiles?: HostCapabilityStatus;
   projectLoaded: boolean;
@@ -203,6 +225,16 @@ export const emptyEditorSnapshot: EditorSnapshot = {
       label: "Local subtitle generation",
       state: "UNAVAILABLE",
       reason: "The host does not expose a verified subtitle generation capability.",
+    },
+    tts: {
+      id: "local-tts",
+      label: "Local voiceover generation",
+      state: "UNAVAILABLE",
+      reason: "The host does not expose a verified Piper voice runtime.",
+    },
+    effects: {
+      state: "UNAVAILABLE",
+      reason: "The host does not expose typed visual effects.",
     },
     audioDucking: {
       state: "UNAVAILABLE",

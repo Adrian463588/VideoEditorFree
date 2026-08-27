@@ -1,6 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use editor_ai::{parse_whisper_json, ModelProvenance};
+use editor_ai::{
+    parse_edit_plan_json, parse_whisper_json, validate_plan_for_apply, ClipContext,
+    ModelProvenance, ProjectContext,
+};
 use editor_app::{ConfiguredMediaPort, EditorApplication, ProjectPort};
 use editor_domain::{
     ApplyResult, Asset, AssetId, AssetKind, AssetStatus, AudioStream, Clip, ClipId, DomainError,
@@ -16,15 +19,51 @@ use editor_project::{load_project, save_project, save_project_if_revision, valid
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
+    io::{Read, Write},
     path::{Path, PathBuf},
-    process::Command,
-    sync::{Arc, Mutex, OnceLock},
-    time::{Duration, UNIX_EPOCH},
+    process::{Command, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, OnceLock,
+    },
+    thread,
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 use tauri::{path::BaseDirectory, AppHandle, Manager, State};
 
 const MAX_PATH_INPUT_BYTES: usize = 32 * 1024;
 const MAX_IMPORT_PATHS: usize = 256;
+const MAX_LLM_OUTPUT_BYTES: usize = 64 * 1024;
+const MAX_LLM_PROMPT_BYTES: usize = 24 * 1024;
+const MAX_COMMAND_ERROR_BYTES: usize = 64 * 1024;
+const MAX_TRANSCRIPT_JSON_BYTES: usize = 16 * 1024 * 1024;
+const LOCAL_LLM_TIMEOUT: Duration = Duration::from_secs(90);
+const LOCAL_LLM_JSON_SCHEMA: &str = r#"{
+  "type": "object",
+  "properties": {
+    "base_revision": {"type": "integer", "minimum": 0},
+    "operations": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "items": {
+        "oneOf": [
+          {"type": "object", "properties": {"op": {"enum": ["trim"]}, "clip_id": {"type": "string", "minLength": 1}, "source_start": {"type": "integer", "minimum": 0}, "source_end": {"type": "integer", "minimum": 1}}, "required": ["op", "clip_id", "source_start", "source_end"], "additionalProperties": false},
+          {"type": "object", "properties": {"op": {"enum": ["split"]}, "clip_id": {"type": "string", "minLength": 1}, "at_timeline_tick": {"type": "integer", "minimum": 0}}, "required": ["op", "clip_id", "at_timeline_tick"], "additionalProperties": false},
+          {"type": "object", "properties": {"op": {"enum": ["delete"]}, "clip_id": {"type": "string", "minLength": 1}}, "required": ["op", "clip_id"], "additionalProperties": false},
+          {"type": "object", "properties": {"op": {"enum": ["ripple_delete"]}, "clip_id": {"type": "string", "minLength": 1}, "track_id": {"type": "string", "minLength": 1}}, "required": ["op", "clip_id", "track_id"], "additionalProperties": false},
+          {"type": "object", "properties": {"op": {"enum": ["reorder"]}, "clip_id": {"type": "string", "minLength": 1}, "track_id": {"type": "string", "minLength": 1}, "new_index": {"type": "integer", "minimum": 0}}, "required": ["op", "clip_id", "track_id", "new_index"], "additionalProperties": false},
+          {"type": "object", "properties": {"op": {"enum": ["effect_preset"]}, "clip_id": {"type": "string", "minLength": 1}, "preset": {"enum": ["warm_color_grade", "cool_color_grade", "monochrome"]}}, "required": ["op", "clip_id", "preset"], "additionalProperties": false}
+        ]
+      }
+    },
+    "warnings": {"type": "array", "maxItems": 32, "items": {"type": "string"}},
+    "affected_clips": {"type": "array", "maxItems": 32, "items": {"type": "string", "minLength": 1}},
+    "requires_confirmation": {"type": "boolean", "enum": [true]}
+  },
+  "required": ["base_revision", "operations", "warnings", "affected_clips", "requires_confirmation"],
+  "additionalProperties": false
+}"#;
 const STT_LANGUAGES: &[&str] = &[
     "auto", "en", "id", "es", "fr", "de", "it", "pt", "ja", "ko", "zh", "ru", "ar", "hi", "nl",
     "tr", "pl", "uk", "vi",
@@ -73,6 +112,8 @@ struct HostStatus {
     media: CapabilityStatus,
     ai: CapabilityStatus,
     subtitles: CapabilityStatus,
+    tts: CapabilityStatus,
+    effects: CapabilityStatus,
     audio_ducking: CapabilityStatus,
     export_profiles: CapabilityStatus,
     project_loaded: bool,
@@ -96,6 +137,14 @@ impl HostError {
     }
     fn unavailable(code: &str, message: &str) -> Self {
         Self::new(code, message)
+    }
+    fn retryable(code: &str, message: &str) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            retryable: true,
+            details: None,
+        }
     }
 }
 impl From<HostError> for AppError {
@@ -228,6 +277,19 @@ struct SubtitleGenerateRequest {
     base_revision: u64,
     track_id: Option<String>,
 }
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TtsGenerateRequest {
+    text: String,
+    voice_id: String,
+    base_revision: u64,
+    track_id: Option<String>,
+}
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AssistantApplyRequest {
+    plan: serde_json::Value,
+}
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -250,6 +312,22 @@ struct SubtitleGenerationResponse {
     document: ProjectDocument,
     language: String,
     cue_count: usize,
+    message: String,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TtsGenerationResponse {
+    job: JobResponse,
+    document: ProjectDocument,
+    voice_id: String,
+    relative_path: String,
+    message: String,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AssistantPlanResponse {
+    plan: editor_ai::EditPlan,
+    provenance: ModelProvenance,
     message: String,
 }
 #[derive(Clone, Debug, Serialize)]
@@ -357,6 +435,41 @@ fn subtitle_runtime_paths(root: &Path) -> (PathBuf, PathBuf) {
 fn subtitle_runtime_ready(root: &Path) -> bool {
     let (executable, model) = subtitle_runtime_paths(root);
     executable.is_file() && model.is_file()
+}
+
+fn tts_runtime_paths(root: &Path, voice_id: &str) -> (PathBuf, PathBuf) {
+    (
+        root.join("ai").join("piper").join("piper.exe"),
+        root.join("voices").join(format!("{voice_id}.onnx")),
+    )
+}
+
+fn tts_runtime_ready(root: &Path, voice_id: &str) -> bool {
+    let (executable, voice) = tts_runtime_paths(root, voice_id);
+    executable.is_file() && voice.is_file() && voice.with_extension("onnx.json").is_file()
+}
+
+fn llm_runtime_paths(root: &Path) -> (PathBuf, PathBuf) {
+    (
+        root.join("ai").join("llama").join("llama-cli.exe"),
+        root.join("models")
+            .join("qwen2.5-0.5b-instruct-q4_k_m.gguf"),
+    )
+}
+
+fn llm_runtime_ready(root: &Path) -> bool {
+    let (executable, model) = llm_runtime_paths(root);
+    executable.is_file() && model.is_file()
+}
+
+fn validate_tts_voice(voice_id: &str) -> Result<(), HostError> {
+    if voice_id != "en_US-lessac-medium" {
+        return Err(HostError::new(
+            "INVALID_REQUEST",
+            "The requested Piper voice is not present in the verified bundle.",
+        ));
+    }
+    Ok(())
 }
 
 fn configured_media_executables() -> Option<ExecutableConfig> {
@@ -853,10 +966,31 @@ fn whisper_transcribe(
             ));
         }
         let json_path = output_prefix.with_extension("json");
-        let json = std::fs::read_to_string(&json_path).map_err(|error| {
+        let file = std::fs::File::open(&json_path).map_err(|error| {
             HostError::new(
                 "AI_TRANSCRIPTION_FAILED",
                 &format!("whisper.cpp did not produce a transcript JSON file: {error}"),
+            )
+        })?;
+        let mut json_bytes = Vec::with_capacity(64 * 1024);
+        file.take((MAX_TRANSCRIPT_JSON_BYTES + 1) as u64)
+            .read_to_end(&mut json_bytes)
+            .map_err(|error| {
+                HostError::new(
+                    "AI_TRANSCRIPTION_FAILED",
+                    &format!("The transcript JSON file could not be read: {error}"),
+                )
+            })?;
+        if json_bytes.len() > MAX_TRANSCRIPT_JSON_BYTES {
+            return Err(HostError::new(
+                "AI_TRANSCRIPTION_OUTPUT_LIMIT",
+                "The whisper.cpp transcript exceeded the 16 MiB output limit.",
+            ));
+        }
+        let json = String::from_utf8(json_bytes).map_err(|_| {
+            HostError::new(
+                "AI_TRANSCRIPTION_FAILED",
+                "whisper.cpp returned transcript JSON that is not valid UTF-8.",
             )
         })?;
         parse_whisper_json(
@@ -941,6 +1075,179 @@ fn cleanup_generated_srt(root: &Path, job_id: JobId, language: &str) {
     let target = root.join("media").join(&file_name);
     let _ = std::fs::remove_file(target);
     let _ = std::fs::remove_file(root.join("media").join(format!(".{file_name}.part")));
+}
+
+fn generated_tts_file_name(job_id: JobId) -> String {
+    format!("tts-voiceover-{job_id}.wav")
+}
+
+fn cleanup_generated_tts(root: &Path, job_id: JobId) {
+    let file_name = generated_tts_file_name(job_id);
+    let media = root.join("media");
+    let _ = std::fs::remove_file(media.join(&file_name));
+    let _ = std::fs::remove_file(media.join(format!(".{file_name}.part")));
+}
+
+fn piper_synthesize(
+    text: &str,
+    piper: &Path,
+    voice: &Path,
+    output: &Path,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(), HostError> {
+    if !piper.is_file() || !voice.is_file() || !voice.with_extension("onnx.json").is_file() {
+        return Err(HostError::unavailable(
+            "TTS_RUNTIME_UNAVAILABLE",
+            "The verified Piper runtime or voice is not provisioned.",
+        ));
+    }
+    let mut process = Command::new(piper)
+        .arg("--model")
+        .arg(voice)
+        .arg("--output_file")
+        .arg(output)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| {
+            HostError::new(
+                "TTS_GENERATION_FAILED",
+                &format!("The Piper process could not start: {error}"),
+            )
+        })?;
+    if let Some(mut stdin) = process.stdin.take() {
+        if let Err(error) = stdin.write_all(text.as_bytes()) {
+            let _ = process.kill();
+            let _ = process.wait();
+            return Err(HostError::new(
+                "TTS_GENERATION_FAILED",
+                &format!("Text could not be sent to Piper: {error}"),
+            ));
+        }
+    }
+    let status = loop {
+        if cancelled() {
+            let _ = process.kill();
+            let _ = process.wait();
+            return Err(HostError::unavailable(
+                "TTS_GENERATION_CANCELLED",
+                "Voiceover generation was cancelled.",
+            ));
+        }
+        match process.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Err(error) => {
+                let _ = process.kill();
+                let _ = process.wait();
+                return Err(HostError::new(
+                    "TTS_GENERATION_FAILED",
+                    &format!("The Piper process could not be monitored: {error}"),
+                ));
+            }
+        }
+    };
+    if !status.success() {
+        return Err(HostError::new(
+            "TTS_GENERATION_FAILED",
+            "Piper could not synthesize the requested voiceover.",
+        ));
+    }
+    if !output.is_file()
+        || std::fs::metadata(output)
+            .map(|metadata| metadata.len() == 0)
+            .unwrap_or(true)
+    {
+        return Err(HostError::new(
+            "TTS_GENERATION_FAILED",
+            "Piper completed without producing a non-empty WAV file.",
+        ));
+    }
+    Ok(())
+}
+
+fn generated_tts_asset(
+    root: &Path,
+    job_id: JobId,
+    probe: ProbeSummary,
+) -> Result<(RelativePath, Asset), HostError> {
+    let file_name = generated_tts_file_name(job_id);
+    let target = root.join("media").join(&file_name);
+    let relative = RelativePath::new(format!("media/{file_name}")).map_err(HostError::from)?;
+    let metadata = std::fs::metadata(&target).map_err(|error| {
+        HostError::new(
+            "TTS_GENERATION_FAILED",
+            &format!("The generated voiceover metadata is unavailable: {error}"),
+        )
+    })?;
+    let modified_time = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|value| value.as_secs().to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let asset = Asset {
+        id: stable_asset_id(relative.as_str())?,
+        relative_path: relative.clone(),
+        kind: AssetKind::Audio,
+        fingerprint: Fingerprint {
+            size_bytes: metadata.len(),
+            modified_time,
+            sha256: None,
+        },
+        probe: Some(probe),
+        status: AssetStatus::Available,
+    };
+    Ok((relative, asset))
+}
+
+fn generated_audio_track(
+    document: &ProjectDocument,
+    requested_track: Option<&str>,
+    job_id: JobId,
+) -> Result<(TrackId, Option<Track>), HostError> {
+    if let Some(raw_id) = requested_track {
+        let track_id = TrackId::new(raw_id.to_owned()).map_err(HostError::from)?;
+        let track = document
+            .sequence
+            .tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .ok_or_else(|| HostError::new("ENTITY_NOT_FOUND", "The audio track was not found."))?;
+        if !matches!(track.kind, TrackKind::Audio) {
+            return Err(HostError::new(
+                "INVALID_REQUEST",
+                "Voiceover generation requires an audio track.",
+            ));
+        }
+        if track.locked {
+            return Err(HostError::new(
+                "TRACK_LOCKED",
+                "The selected audio track is locked.",
+            ));
+        }
+        return Ok((track_id, None));
+    }
+    let track_id = TrackId::new(format!("voiceover-layer-{job_id}")).map_err(HostError::from)?;
+    let track = Track::new(
+        track_id.clone(),
+        TrackKind::Audio,
+        format!("Voiceover {job_id}"),
+    )
+    .map_err(HostError::from)?;
+    Ok((track_id, Some(track)))
+}
+
+fn seconds_to_ticks(seconds: f64, timebase: Rational, code: &str) -> Result<i64, HostError> {
+    let ticks = (seconds * timebase.numerator as f64 / timebase.denominator as f64).round();
+    if !ticks.is_finite() || ticks <= 0.0 || ticks > i64::MAX as f64 {
+        return Err(HostError::new(
+            code,
+            "The generated media duration is out of range.",
+        ));
+    }
+    Ok(ticks as i64)
 }
 
 fn generated_subtitle_track(
@@ -1055,7 +1362,7 @@ fn bundle_download(
     let script = bundle_script_path(&app)?;
     let manifest = bundle_manifest_path(&app)?;
     let install_root = default_bundle_root();
-    let output = Command::new("powershell.exe")
+    let mut process = Command::new("powershell.exe")
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -1070,15 +1377,59 @@ fn bundle_download(
         .arg(&install_root)
         .arg("-ManifestPath")
         .arg(&manifest)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|error| {
             HostError::new(
                 "BUNDLE_DOWNLOAD_FAILED",
                 &format!("The runtime bundle downloader could not start: {error}"),
             )
         })?;
-    if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr);
+    let stderr = process.stderr.take().ok_or_else(|| {
+        let _ = process.kill();
+        let _ = process.wait();
+        HostError::new(
+            "BUNDLE_DOWNLOAD_FAILED",
+            "The runtime bundle downloader did not expose an error pipe.",
+        )
+    })?;
+    let stderr_thread = thread::spawn(move || {
+        read_bounded_pipe(
+            stderr,
+            MAX_COMMAND_ERROR_BYTES,
+            Arc::new(AtomicBool::new(false)),
+        )
+    });
+    let status = match process.wait() {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = process.kill();
+            let _ = process.wait();
+            let _ = stderr_thread.join();
+            return Err(HostError::new(
+                "BUNDLE_DOWNLOAD_FAILED",
+                &format!("The runtime bundle downloader failed: {error}"),
+            ));
+        }
+    };
+    let stderr = stderr_thread
+        .join()
+        .map_err(|_| {
+            HostError::new(
+                "BUNDLE_DOWNLOAD_FAILED",
+                "The runtime bundle downloader error reader failed.",
+            )
+        })?
+        .map_err(|error| {
+            HostError::new(
+                "BUNDLE_DOWNLOAD_FAILED",
+                &format!("The runtime bundle downloader error pipe failed: {error}"),
+            )
+        })?;
+    if !status.success() {
+        let detail = String::from_utf8_lossy(&stderr);
         let detail = detail.lines().last().unwrap_or("download failed");
         return Err(HostError::new(
             "BUNDLE_DOWNLOAD_FAILED",
@@ -1122,12 +1473,17 @@ fn host_status(state: State<'_, AppState>) -> HostStatus {
         .0
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let bundle_root = default_bundle_root();
+    let media_ready = host.media.is_configured();
+    let ai_ready = llm_runtime_ready(&bundle_root);
+    let subtitle_ready = subtitle_runtime_ready(&bundle_root);
+    let tts_ready = tts_runtime_ready(&bundle_root, "en_US-lessac-medium");
     HostStatus {
         core: CapabilityStatus {
             state: "READY",
             reason: "Project domain and persistence APIs are available.",
         },
-        media: if host.media.is_configured() {
+        media: if media_ready {
             CapabilityStatus {
                 state: "READY",
                 reason: "A configured media runtime is available.",
@@ -1139,10 +1495,18 @@ fn host_status(state: State<'_, AppState>) -> HostStatus {
             }
         },
         ai: CapabilityStatus {
-            state: "UNAVAILABLE",
-            reason: "No verified local AI runtime or model is provisioned.",
+            state: if ai_ready {
+                "READY"
+            } else {
+                "UNAVAILABLE"
+            },
+            reason: if ai_ready {
+                "The local llama.cpp planner and Qwen model are available."
+            } else {
+                "Download and verify the AI bundle to enable the local edit planner."
+            },
         },
-        subtitles: if subtitle_runtime_ready(&default_bundle_root()) {
+        subtitles: if subtitle_ready {
             CapabilityStatus {
                 state: "READY",
                 reason: "The local multilingual Whisper subtitle runtime is available.",
@@ -1153,11 +1517,26 @@ fn host_status(state: State<'_, AppState>) -> HostStatus {
                 reason: "Download and verify the Subtitle AI bundle to generate local captions.",
             }
         },
+        tts: if tts_ready {
+            CapabilityStatus {
+                state: "READY",
+                reason: "The local Piper runtime and verified en_US voice are available.",
+            }
+        } else {
+            CapabilityStatus {
+                state: "UNAVAILABLE",
+                reason: "Download and verify the AI bundle to generate local voiceovers.",
+            }
+        },
+        effects: CapabilityStatus {
+            state: "READY",
+            reason: "Typed CPU video and audio effects are available; no measured GPU backend is claimed.",
+        },
         audio_ducking: CapabilityStatus {
             state: "READY",
             reason: "Typed sidechain ducking is available in the timeline and export planner.",
         },
-        export_profiles: if host.media.is_configured() {
+        export_profiles: if media_ready {
             CapabilityStatus {
                 state: "READY",
                 reason: "YouTube, Instagram Reels, and TikTok MP4 presets are available.",
@@ -1330,6 +1709,7 @@ fn subtitle_generate(
     if request.asset_id.trim().is_empty() {
         return Err(invalid_request());
     }
+    let _ai_slot = acquire_local_ai_slot()?;
     let (shared, jobs, snapshot, source, config, whisper, model, root, handle) = {
         let host = state
             .0
@@ -1460,6 +1840,7 @@ fn subtitle_generate(
             transform: Transform::default(),
             effects: Vec::new(),
             keyframes: Vec::new(),
+            text_overlay: None,
         };
         let host = state
             .0
@@ -1638,29 +2019,501 @@ fn job_cancel(request: JobRequest, state: State<'_, AppState>) -> Result<JobResp
         .map(JobResponse::from)
         .map_err(HostError::from)
 }
+
+#[tauri::command]
+fn tts_generate(
+    request: TtsGenerateRequest,
+    state: State<'_, AppState>,
+) -> Result<TtsGenerationResponse, HostError> {
+    validate_tts_voice(&request.voice_id)?;
+    if request.text.trim().is_empty() || request.text.len() > 8 * 1024 {
+        return Err(HostError::new(
+            "INVALID_REQUEST",
+            "Voiceover text must contain 1..=8192 bytes.",
+        ));
+    }
+    let _ai_slot = acquire_local_ai_slot()?;
+    let (shared, jobs, snapshot, media, piper, voice, root, handle) = {
+        let host = state
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if host.project_path.is_none() {
+            return Err(HostError::new(
+                "PROJECT_PATH_REQUIRED",
+                "Create or save a project before generating a voiceover.",
+            ));
+        }
+        let snapshot = host.app.snapshot().map_err(HostError::from)?;
+        if request.base_revision != snapshot.document.revision {
+            return Err(HostError::from(AppError::revision_conflict(
+                request.base_revision,
+                snapshot.document.revision,
+            )));
+        }
+        let (piper, voice) = tts_runtime_paths(&default_bundle_root(), &request.voice_id);
+        let jobs = host.app.jobs().clone();
+        let handle = jobs
+            .submit(JobKind::Tts, snapshot.metadata.clone())
+            .map_err(HostError::from)?;
+        jobs.start(handle.id).map_err(HostError::from)?;
+        (
+            host.shared.clone(),
+            jobs,
+            snapshot,
+            host.media.clone(),
+            piper,
+            voice,
+            project_root(&host),
+            handle,
+        )
+    };
+    let target = root.join("media").join(generated_tts_file_name(handle.id));
+    let temporary = root
+        .join("media")
+        .join(format!(".{}.part", generated_tts_file_name(handle.id)));
+    let postprocess = (|| {
+        std::fs::create_dir_all(root.join("media")).map_err(|error| {
+            HostError::new(
+                "TTS_GENERATION_FAILED",
+                &format!("The project media directory could not be created: {error}"),
+            )
+        })?;
+        piper_synthesize(request.text.trim(), &piper, &voice, &temporary, &|| {
+            handle.token.is_cancelled()
+        })?;
+        std::fs::rename(&temporary, &target).map_err(|error| {
+            HostError::new(
+                "TTS_GENERATION_FAILED",
+                &format!("The generated voiceover could not be finalized: {error}"),
+            )
+        })?;
+        let probe = probe_summary(media.probe(&target).map_err(HostError::from)?)?;
+        let source_duration = probe.duration_ticks;
+        let seconds = source_duration as f64 * probe.stream_timebase.denominator as f64
+            / probe.stream_timebase.numerator as f64;
+        let timeline_duration = seconds_to_ticks(
+            seconds,
+            snapshot.document.sequence.timebase,
+            "TTS_GENERATION_FAILED",
+        )?;
+        let (relative, asset) = generated_tts_asset(&root, handle.id, probe)?;
+        let (track_id, new_track) =
+            generated_audio_track(&snapshot.document, request.track_id.as_deref(), handle.id)?;
+        let timeline_start = snapshot
+            .document
+            .sequence
+            .tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .and_then(|track| {
+                track
+                    .clips
+                    .iter()
+                    .filter_map(|clip| clip.timeline_start.checked_add(clip.timeline_duration))
+                    .max()
+            })
+            .unwrap_or(0);
+        let clip = Clip {
+            id: ClipId::new(format!("tts-clip-{}", handle.id)).map_err(HostError::from)?,
+            asset_id: asset.id.clone(),
+            timeline_start,
+            timeline_duration,
+            source_start: 0,
+            source_duration,
+            speed: Rational::new(1, 1).expect("constant rational is valid"),
+            opacity: 1.0,
+            transform: Transform::default(),
+            effects: Vec::new(),
+            keyframes: Vec::new(),
+            text_overlay: None,
+        };
+        let host = state
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = shared.current_document().map_err(HostError::from)?;
+        if current.revision != snapshot.document.revision {
+            return Err(HostError::from(AppError::revision_conflict(
+                snapshot.document.revision,
+                current.revision,
+            )));
+        }
+        if handle.token.is_cancelled() {
+            return Err(HostError::unavailable(
+                "TTS_GENERATION_CANCELLED",
+                "Voiceover generation was cancelled.",
+            ));
+        }
+        let mut document = current
+            .apply(current.revision, TimelineOperation::AddAsset { asset })
+            .map_err(HostError::from)?
+            .document;
+        if let Some(track) = new_track {
+            document = document
+                .apply(document.revision, TimelineOperation::AddTrack { track })
+                .map_err(HostError::from)?
+                .document;
+        }
+        document = document
+            .apply(
+                document.revision,
+                TimelineOperation::AddClip { track_id, clip },
+            )
+            .map_err(HostError::from)?
+            .document;
+        host.shared.replace(document.clone());
+        Ok((relative, document))
+    })();
+    let (relative, document) = match postprocess {
+        Ok(value) => value,
+        Err(error) => {
+            cleanup_generated_tts(&root, handle.id);
+            if error.code == "TTS_GENERATION_CANCELLED" {
+                let _ = jobs.mark_cancelled(handle.id);
+            } else {
+                let _ = jobs.mark_failed(handle.id, AppError::from(error.clone()));
+            }
+            return Err(error);
+        }
+    };
+    let job = jobs
+        .mark_succeeded(handle.id, Some(relative.clone()))
+        .map(JobResponse::from)
+        .map_err(HostError::from)?;
+    Ok(TtsGenerationResponse {
+        job,
+        document,
+        voice_id: request.voice_id,
+        relative_path: relative.to_string(),
+        message: "Local Piper voiceover generated and added to an audio layer.".into(),
+    })
+}
+
+fn project_context(document: &ProjectDocument) -> Result<ProjectContext, HostError> {
+    let clips = document
+        .sequence
+        .tracks
+        .iter()
+        .flat_map(|track| {
+            track.clips.iter().map(|clip| {
+                Ok(ClipContext {
+                    clip_id: clip.id.clone(),
+                    asset_id: clip.asset_id.clone(),
+                    timeline_range: clip.timeline_range().map_err(HostError::from)?,
+                    source_range: clip.source_range().map_err(HostError::from)?,
+                    locked: track.locked,
+                })
+            })
+        })
+        .collect::<Result<Vec<_>, HostError>>()?;
+    Ok(ProjectContext {
+        project_id: document.project_id.clone(),
+        base_revision: document.revision,
+        clips,
+    })
+}
+
+fn local_plan_prompt(context: &ProjectContext, instruction: &str) -> Result<String, HostError> {
+    let context_json = serde_json::to_string(context).map_err(|error| {
+        HostError::new(
+            "AI_PLAN_FAILED",
+            &format!("The local planner context could not be serialized: {error}"),
+        )
+    })?;
+    let prompt = [
+        "You are an offline NLE edit planner. Return ONLY one JSON object and no markdown. ",
+        "Use only existing clip IDs from context. Allowed operations are trim with source_start/source_end, split with at_timeline_tick, delete, ripple_delete with track_id, reorder with track_id/new_index, or effect_preset with preset warm_color_grade, cool_color_grade, or monochrome. ",
+        "The JSON schema is {base_revision:number,operations:[{op:string,clip_id:string,...}],warnings:string[],affected_clips:string[],requires_confirmation:true}. ",
+        "Numbers must be JSON integers, never quoted strings. Emit at least one operation. Do not emit paths, commands, URLs, filtergraphs, or network actions.\nContext: ",
+        context_json.as_str(),
+        "\nInstruction: ",
+        instruction,
+    ]
+    .concat();
+    if prompt.len() > MAX_LLM_PROMPT_BYTES {
+        return Err(HostError::new(
+            "AI_PLAN_FAILED",
+            "The local planner prompt exceeds the bounded context limit.",
+        ));
+    }
+    Ok(prompt)
+}
+
+fn extract_json_object(output: &str) -> Option<&str> {
+    let start = output.find('{')?;
+    let end = output.rfind('}')?;
+    (start < end).then(|| &output[start..=end])
+}
+
+fn read_bounded_pipe(
+    mut pipe: impl Read,
+    max_bytes: usize,
+    exceeded: Arc<AtomicBool>,
+) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(max_bytes.min(8 * 1024));
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let count = pipe.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        let remaining = max_bytes.saturating_sub(bytes.len());
+        let keep = remaining.min(count);
+        bytes.extend_from_slice(&buffer[..keep]);
+        if keep < count {
+            exceeded.store(true, Ordering::Release);
+        }
+    }
+    Ok(bytes)
+}
+
+fn acquire_local_ai_slot() -> Result<std::sync::MutexGuard<'static, ()>, HostError> {
+    static SLOT: OnceLock<Mutex<()>> = OnceLock::new();
+    match SLOT.get_or_init(|| Mutex::new(())).try_lock() {
+        Ok(guard) => Ok(guard),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => Ok(poisoned.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => Err(HostError::retryable(
+            "AI_BUSY",
+            "A local AI operation is already running; try again after it completes.",
+        )),
+    }
+}
+
+fn run_local_llm(llama: &Path, model: &Path, prompt: &str) -> Result<Vec<u8>, HostError> {
+    let model_path = model.to_string_lossy().into_owned();
+    let arguments = vec![
+        "-m".to_owned(),
+        model_path,
+        "--ctx-size".to_owned(),
+        "4096".to_owned(),
+        "--threads".to_owned(),
+        "2".to_owned(),
+        "-n".to_owned(),
+        "256".to_owned(),
+        "--temp".to_owned(),
+        "0".to_owned(),
+        "--seed".to_owned(),
+        "42".to_owned(),
+        "--single-turn".to_owned(),
+        "--simple-io".to_owned(),
+        "--no-display-prompt".to_owned(),
+        "--no-jinja".to_owned(),
+        "--no-perf".to_owned(),
+        "--json-schema".to_owned(),
+        LOCAL_LLM_JSON_SCHEMA.to_owned(),
+        "-p".to_owned(),
+        prompt.to_owned(),
+    ];
+    let mut process = Command::new(llama)
+        .args(&arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| {
+            HostError::new(
+                "AI_PLAN_FAILED",
+                &format!("The llama.cpp process could not start: {error}"),
+            )
+        })?;
+    let stdout = process.stdout.take().ok_or_else(|| {
+        let _ = process.kill();
+        let _ = process.wait();
+        HostError::new(
+            "AI_PLAN_FAILED",
+            "The llama.cpp process did not expose an output pipe.",
+        )
+    })?;
+    let output_limited = Arc::new(AtomicBool::new(false));
+    let reader_flag = Arc::clone(&output_limited);
+    let stdout_thread =
+        thread::spawn(move || read_bounded_pipe(stdout, MAX_LLM_OUTPUT_BYTES, reader_flag));
+    let started = Instant::now();
+    let mut status = None;
+    let mut wait_error = None;
+    let mut timed_out = false;
+    loop {
+        if output_limited.load(Ordering::Acquire) {
+            let _ = process.kill();
+            status = process.wait().ok();
+            break;
+        }
+        if started.elapsed() >= LOCAL_LLM_TIMEOUT {
+            timed_out = true;
+            let _ = process.kill();
+            status = process.wait().ok();
+            break;
+        }
+        match process.try_wait() {
+            Ok(Some(exit_status)) => {
+                status = Some(exit_status);
+                break;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(error) => {
+                wait_error = Some(error);
+                let _ = process.kill();
+                let _ = process.wait();
+                break;
+            }
+        }
+    }
+    let stdout = stdout_thread
+        .join()
+        .map_err(|_| HostError::new("AI_PLAN_FAILED", "The llama.cpp output reader failed."))?
+        .map_err(|error| {
+            HostError::new(
+                "AI_PLAN_FAILED",
+                &format!("The llama.cpp output pipe failed: {error}"),
+            )
+        })?;
+    if let Some(error) = wait_error {
+        return Err(HostError::new(
+            "AI_PLAN_FAILED",
+            &format!("The llama.cpp process could not be monitored: {error}"),
+        ));
+    }
+    if timed_out {
+        return Err(HostError::retryable(
+            "AI_PLAN_TIMEOUT",
+            "The local language model exceeded the 90 second resource limit.",
+        ));
+    }
+    if output_limited.load(Ordering::Acquire) {
+        return Err(HostError::new(
+            "AI_PLAN_OUTPUT_LIMIT",
+            "The local language model exceeded the 64 KiB output limit.",
+        ));
+    }
+    let status = status.ok_or_else(|| {
+        HostError::new(
+            "AI_PLAN_FAILED",
+            "The local language model exited without a process status.",
+        )
+    })?;
+    if !status.success() {
+        return Err(HostError::new(
+            "AI_PLAN_FAILED",
+            "The local language model returned a failed process status.",
+        ));
+    }
+    Ok(stdout)
+}
+
+fn local_llm_plan(
+    document: &ProjectDocument,
+    instruction: &str,
+) -> Result<AssistantPlanResponse, HostError> {
+    let root = default_bundle_root();
+    let (llama, model) = llm_runtime_paths(&root);
+    if !llm_runtime_ready(&root) {
+        return Err(HostError::unavailable(
+            "AI_UNAVAILABLE",
+            "The verified llama.cpp runtime or Qwen model is not provisioned.",
+        ));
+    }
+    let context = project_context(document)?;
+    let prompt = local_plan_prompt(&context, instruction)?;
+    let _ai_slot = acquire_local_ai_slot()?;
+    let output = run_local_llm(&llama, &model, &prompt)?;
+    let stdout = String::from_utf8_lossy(&output);
+    let json = extract_json_object(&stdout).ok_or_else(|| {
+        HostError::new(
+            "AI_PLAN_FAILED",
+            "The local language model did not return a JSON edit plan.",
+        )
+    })?;
+    let plan = parse_edit_plan_json(json).map_err(|error| {
+        HostError::new(
+            "AI_PLAN_INVALID",
+            &format!("The local model returned an invalid edit plan: {error}"),
+        )
+    })?;
+    if plan.base_revision != document.revision {
+        return Err(HostError::new(
+            "AI_PLAN_INVALID",
+            "The local model returned a stale base revision.",
+        ));
+    }
+    validate_plan_for_apply(document, &plan, true).map_err(|error| {
+        HostError::new(
+            "AI_PLAN_INVALID",
+            &format!("The edit plan does not apply to the current project: {error}"),
+        )
+    })?;
+    Ok(AssistantPlanResponse {
+        plan,
+        provenance: ModelProvenance {
+            provider: "llama.cpp".into(),
+            model_id: "Qwen2.5-0.5B-Instruct-Q4_K_M".into(),
+            model_version: "Qwen2.5".into(),
+        },
+        message: "Local edit plan generated; review and confirm before applying.".into(),
+    })
+}
+
 #[tauri::command]
 fn assistant_plan(
     request: AssistantPlanRequest,
     state: State<'_, AppState>,
-) -> Result<(), HostError> {
-    if request.text.trim().is_empty() || request.text.len() > 64 * 1024 {
+) -> Result<AssistantPlanResponse, HostError> {
+    if request.text.trim().is_empty() || request.text.len() > 8 * 1024 {
         return Err(invalid_request());
     }
-    let host = state
-        .0
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let snapshot = host.app.snapshot().map_err(HostError::from)?;
+    let snapshot = {
+        let host = state
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        host.app.snapshot().map_err(HostError::from)?
+    };
     if request.base_revision != snapshot.document.revision {
         return Err(HostError::from(AppError::revision_conflict(
             request.base_revision,
             snapshot.document.revision,
         )));
     }
-    Err(HostError::unavailable(
-        "AI_UNAVAILABLE",
-        "No configured local language-model provider or verified model is available.",
-    ))
+    local_llm_plan(&snapshot.document, request.text.trim())
+}
+
+#[tauri::command]
+fn assistant_apply(
+    request: AssistantApplyRequest,
+    state: State<'_, AppState>,
+) -> Result<ApplyResult, HostError> {
+    let json = serde_json::to_string(&request.plan).map_err(|_| invalid_request())?;
+    let plan = parse_edit_plan_json(&json).map_err(|error| {
+        HostError::new(
+            "AI_PLAN_INVALID",
+            &format!("The edit plan could not be parsed: {error}"),
+        )
+    })?;
+    let host = state
+        .0
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let current = host.app.snapshot().map_err(HostError::from)?.document;
+    let validated = validate_plan_for_apply(&current, &plan, true).map_err(|error| {
+        HostError::new(
+            "AI_PLAN_INVALID",
+            &format!("The edit plan no longer applies: {error}"),
+        )
+    })?;
+    let mut document = current;
+    let mut last = None;
+    for operation in validated.operations() {
+        let result = document
+            .apply(document.revision, operation.clone())
+            .map_err(HostError::from)?;
+        document = result.document.clone();
+        last = Some(result);
+    }
+    let mut result =
+        last.ok_or_else(|| HostError::new("AI_PLAN_INVALID", "The edit plan is empty."))?;
+    result.document = document.clone();
+    host.shared.replace(document);
+    Ok(result)
 }
 
 fn main() {
@@ -1689,6 +2542,7 @@ fn main() {
             project_save,
             asset_import,
             subtitle_generate,
+            tts_generate,
             timeline_apply,
             preview_play,
             preview_pause,
@@ -1698,7 +2552,8 @@ fn main() {
             job_get,
             job_list,
             job_cancel,
-            assistant_plan
+            assistant_plan,
+            assistant_apply
         ])
         .run(tauri::generate_context!())
         .expect("error while running VideoEditorFree");
@@ -1772,6 +2627,23 @@ mod tests {
     #[test]
     fn malformed_job_id_is_not_found() {
         assert_eq!(parse_job_id("nope").unwrap_err().code, "JOB_NOT_FOUND");
+    }
+    #[test]
+    fn local_llm_json_schema_is_valid() {
+        serde_json::from_str::<serde_json::Value>(LOCAL_LLM_JSON_SCHEMA)
+            .expect("the local planner schema must be valid JSON");
+    }
+    #[test]
+    fn local_process_output_is_bounded() {
+        let exceeded = Arc::new(AtomicBool::new(false));
+        let output = read_bounded_pipe(
+            std::io::Cursor::new(vec![1_u8; MAX_LLM_OUTPUT_BYTES + 1]),
+            MAX_LLM_OUTPUT_BYTES,
+            Arc::clone(&exceeded),
+        )
+        .expect("bounded reader should accept an in-memory pipe");
+        assert_eq!(output.len(), MAX_LLM_OUTPUT_BYTES);
+        assert!(exceeded.load(Ordering::Acquire));
     }
     #[test]
     fn relative_path_rejects_absolute_export() {

@@ -773,6 +773,7 @@ mod tests {
             transform: Transform::default(),
             effects: Vec::new(),
             keyframes: Vec::new(),
+            text_overlay: None,
         });
         document.validate().unwrap();
         document
