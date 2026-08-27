@@ -565,7 +565,8 @@ impl Sha256 {
             0xc67178f2,
         ];
         let mut words = [0_u32; 64];
-        for (index, chunk) in block.chunks_exact(4).take(16).enumerate() {
+        let (chunks, _) = block.as_chunks::<4>();
+        for (index, chunk) in chunks.iter().take(16).enumerate() {
             words[index] = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         }
         for index in 16..64 {
