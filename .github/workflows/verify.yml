@@ -1,0 +1,39 @@
+name: Verify
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+      - name: Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install JavaScript dependencies
+        run: npm ci
+      - name: Verify bundle manifest and allowlist
+        run: npm run verify:bundle
+      - name: Rust format
+        run: cargo fmt --all -- --check
+      - name: Rust tests
+        run: cargo test --locked --workspace
+      - name: Rust lint
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Rust build
+        run: cargo build --locked --workspace
+      - name: Frontend typecheck and build
+        run: npm run build

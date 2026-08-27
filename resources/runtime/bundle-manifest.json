@@ -1,0 +1,110 @@
+{
+  "schema_version": 1,
+  "bundle_id": "videoeditorfree-windows-x64",
+  "version": "2026.08.27",
+  "target": {
+    "os": "windows",
+    "architecture": "x86_64"
+  },
+  "artifacts": [
+    {
+      "id": "ffmpeg-windows-x64-gpl",
+      "kind": "media-runtime",
+      "profile": "core",
+      "file_name": "ffmpeg-master-latest-win64-gpl.zip",
+      "destination": "downloads/ffmpeg-master-latest-win64-gpl.zip",
+      "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip",
+      "source": "https://ffmpeg.org/download.html",
+      "version": "BtbN latest FFmpeg master win64 GPL",
+      "license": "GPL-3.0-or-later",
+      "size_bytes": 170676191,
+      "sha256": "06496188114b93337cdb10e38e5d3c8d7ffe467af2bc912268b601fa868d02cc",
+      "archive": true
+    },
+    {
+      "id": "llama-cpp-windows-x64-cpu",
+      "kind": "llm-runtime",
+      "profile": "ai",
+      "file_name": "llama-b10642-bin-win-cpu-x64.zip",
+      "destination": "downloads/llama-b10642-bin-win-cpu-x64.zip",
+      "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10642/llama-b10642-bin-win-cpu-x64.zip",
+      "source": "https://github.com/ggml-org/llama.cpp/releases/tag/b10642",
+      "version": "b10642",
+      "license": "MIT",
+      "size_bytes": 18076036,
+      "sha256": "b90c4b018de11961a25a2555427fa1576267e6499b3e2f873433d9188ec929e2",
+      "archive": true
+    },
+    {
+      "id": "piper-windows-x64-runtime",
+      "kind": "tts-runtime",
+      "profile": "ai",
+      "file_name": "piper_windows_amd64.zip",
+      "destination": "downloads/piper_windows_amd64.zip",
+      "url": "https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_windows_amd64.zip",
+      "source": "https://github.com/rhasspy/piper/releases/tag/2023.11.14-2",
+      "version": "2023.11.14-2",
+      "license": "MIT",
+      "size_bytes": 22477236,
+      "sha256": "f3c58906402b24f3a96d92145f58acba6d86c9b5db896d207f78dc80811efcea",
+      "sha256_basis": "Recomputed with certutil from the immutable upstream release asset; upstream API did not publish a digest.",
+      "archive": true
+    },
+    {
+      "id": "whisper-cpp-tiny-en-model",
+      "kind": "stt-model",
+      "profile": "ai",
+      "file_name": "ggml-tiny.en.bin",
+      "destination": "models/ggml-tiny.en.bin",
+      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin?download=true",
+      "source": "https://huggingface.co/ggerganov/whisper.cpp",
+      "version": "ggml-tiny.en",
+      "license": "MIT",
+      "size_bytes": 77704715,
+      "sha256": "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f",
+      "archive": false
+    },
+    {
+      "id": "qwen25-05b-instruct-q4-k-m",
+      "kind": "llm-model",
+      "profile": "ai",
+      "file_name": "qwen2.5-0.5b-instruct-q4_k_m.gguf",
+      "destination": "models/qwen2.5-0.5b-instruct-q4_k_m.gguf",
+      "url": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf?download=true",
+      "source": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+      "version": "Qwen2.5-0.5B-Instruct Q4_K_M",
+      "license": "Apache-2.0",
+      "size_bytes": 491400032,
+      "sha256": "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db",
+      "archive": false
+    },
+    {
+      "id": "piper-lessac-medium-voice",
+      "kind": "tts-voice",
+      "profile": "ai",
+      "file_name": "en_US-lessac-medium.onnx",
+      "destination": "voices/en_US-lessac-medium.onnx",
+      "url": "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/en_US-lessac-medium.onnx?download=true",
+      "source": "https://huggingface.co/rhasspy/piper-voices/tree/v1.0.0/en/en_US/lessac/medium",
+      "version": "lessac medium en_US",
+      "license": "MIT model repository; review MODEL_CARD dataset terms",
+      "size_bytes": 63201294,
+      "sha256": "5efe09e69902187827af646e1a6e9d269dee769f9877d17b16b1b46eeaaf019f",
+      "archive": false
+    },
+    {
+      "id": "piper-lessac-medium-config",
+      "kind": "tts-voice-config",
+      "profile": "ai",
+      "file_name": "en_US-lessac-medium.onnx.json",
+      "destination": "voices/en_US-lessac-medium.onnx.json",
+      "url": "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json?download=true",
+      "source": "https://huggingface.co/rhasspy/piper-voices/tree/v1.0.0/en/en_US/lessac/medium",
+      "version": "lessac medium en_US config",
+      "license": "MIT model repository; review MODEL_CARD dataset terms",
+      "size_bytes": 4885,
+      "sha256": "efe19c417bed055f2d69908248c6ba650fa135bc868b0e6abb3da181dab690a0",
+      "archive": false
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+node_modules/
+dist/
+target/
+*.tsbuildinfo
+
+apps/desktop/src-tauri/gen/
+apps/desktop/src-tauri/binaries/
+
+# Provisioned runtime/model files stay outside Git.
+.videoeditorfree-cache/
+/runtime/
+resources/runtime/downloads/
+resources/runtime/installed/
+.videoeditorfree/
+
+*.vdeproj
+evidence/
+
+.env
+.env.*
+!.env.example

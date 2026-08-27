@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://videoeditorfree.invalid/schemas/asset-manifest.schema.json",
+  "title": "VideoEditorFree asset provenance manifest",
+  "description": "Manifest for supplied, licensed evidence assets. Empty manifests are valid only when status is BLOCKED.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "status", "assets"],
+  "properties": {
+    "schema_version": { "type": "string", "const": "1" },
+    "status": { "type": "string", "enum": ["BLOCKED", "READY"] },
+    "reason": { "type": "string", "minLength": 1 },
+    "assets": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/asset" }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "const": "BLOCKED" } } },
+      "then": { "required": ["reason"] }
+    },
+    {
+      "if": { "properties": { "status": { "const": "READY" } } },
+      "then": {
+        "properties": { "assets": { "minItems": 1 } }
+      }
+    }
+  ],
+  "$defs": {
+    "asset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "path", "source", "license", "size_bytes", "sha256", "architecture", "status"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "kind": { "type": "string", "enum": ["media", "binary", "model", "voice", "output"] },
+        "path": { "type": "string", "minLength": 1 },
+        "source": { "type": "string", "minLength": 1 },
+        "license": { "type": "string", "minLength": 1 },
+        "license_notice": { "type": "string", "minLength": 1 },
+        "size_bytes": { "type": "integer", "minimum": 1 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+        "architecture": { "type": "string", "minLength": 1 },
+        "status": { "type": "string", "enum": ["PROVISIONED", "VERIFYING", "BLOCKED", "UNAVAILABLE"] },
+        "ffprobe_json": { "type": "string", "minLength": 1 },
+        "expected": { "type": "object", "additionalProperties": true }
+      }
+    }
+  }
+}

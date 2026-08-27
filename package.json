@@ -1,0 +1,18 @@
+{
+  "name": "video-editor-free",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/desktop"
+  ],
+  "scripts": {
+    "dev": "npm --workspace apps/desktop run dev",
+    "build": "npm --workspace apps/desktop run build",
+    "typecheck": "npm --workspace apps/desktop run typecheck",
+    "tauri": "npm --workspace apps/desktop run tauri --",
+    "bundle:download": "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/runtime/download-bundle.ps1",
+    "verify:bundle": "node scripts/runtime/verify-bundle-manifest.mjs && powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/runtime/download-bundle.ps1 -VerifyManifestOnly",
+    "verify:manifest": "node scripts/evidence/validate-record.mjs scripts/manifest/g0-scope.json",
+    "verify:g0": "npm run typecheck && npm run build && npm run verify:manifest"
+  }
+}

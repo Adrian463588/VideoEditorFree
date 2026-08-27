@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "phase": "G0",
+  "status": "BLOCKED",
+  "source_revision": {
+    "kind": "non-git-checkout",
+    "value": "No .git directory was present during W0 audit"
+  },
+  "target": {
+    "os": "Windows",
+    "architecture": "x86_64",
+    "frontend": "React + TypeScript + Vite",
+    "host": "Tauri 2",
+    "core": "Rust workspace"
+  },
+  "entries": [
+    {
+      "id": "rust-toolchain",
+      "status": "PASS",
+      "version": "rustc 1.96.0 / cargo 1.96.0",
+      "architecture": "x86_64-pc-windows-msvc",
+      "evidence": ["rustc --version", "cargo --version", "rustup target list --installed"]
+    },
+    {
+      "id": "node-toolchain",
+      "status": "PASS",
+      "version": "node v24.11.0 / npm 11.6.1",
+      "architecture": "windows-x64",
+      "evidence": ["node --version", "npm --version"]
+    },
+    {
+      "id": "tauri-toolchain",
+      "status": "PASS",
+      "version": "tauri-cli 2.11.4",
+      "architecture": "windows-x64",
+      "evidence": ["cargo-tauri --version"]
+    },
+    {
+      "id": "ffmpeg-bundle",
+      "status": "BLOCKED",
+      "reason": "No reviewed bundled ffmpeg.exe/ffprobe.exe, source, license, architecture, or SHA-256 is present. W0 does not download it."
+    },
+    {
+      "id": "licensed-media-fixture",
+      "status": "BLOCKED",
+      "reason": "No licensed real media fixture or expected ffprobe metadata is present."
+    },
+    {
+      "id": "optional-ai-runtimes",
+      "status": "UNAVAILABLE",
+      "reason": "No local STT, LLM, TTS, or generative-video model/runtime is provisioned."
+    }
+  ]
+}

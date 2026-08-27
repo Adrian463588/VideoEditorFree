@@ -1,0 +1,22 @@
+[package]
+name = "video-editor-free-desktop"
+version = "0.1.0"
+description = "VideoEditorFree Windows desktop shell"
+authors = ["VideoEditorFree contributors"]
+edition = "2021"
+rust-version = "1.77"
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }
+
+[dependencies]
+tauri = { version = "2.11.5", default-features = false, features = ["wry"] }
+tauri-plugin-dialog = "2.7.2"
+editor-app = { path = "../../../crates/editor-app" }
+editor-ai = { path = "../../../crates/editor-ai" }
+editor-domain = { path = "../../../crates/editor-domain" }
+editor-media = { path = "../../../crates/editor-media" }
+editor-jobs = { path = "../../../crates/editor-jobs" }
+editor-project = { path = "../../../crates/editor-project" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

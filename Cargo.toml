@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = [
+    "apps/desktop/src-tauri",
+    "crates/editor-domain",
+    "crates/editor-project",
+    "crates/editor-media",
+    "crates/editor-jobs",
+    "crates/editor-app",
+    "crates/editor-ai",
+]

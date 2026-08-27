@@ -1,0 +1,19 @@
+[package]
+name = "editor-app"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+editor-domain = { path = "../editor-domain" }
+editor-media = { path = "../editor-media" }
+editor-jobs = { path = "../editor-jobs" }
+editor-project = { path = "../editor-project", optional = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[features]
+default = []
+neighbor-crates = ["dep:editor-project"]
+
+[dev-dependencies]

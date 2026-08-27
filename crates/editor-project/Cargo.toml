@@ -1,0 +1,9 @@
+[package]
+name = "editor-project"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+editor-domain = { path = "../editor-domain" }
+serde_json = "1.0"
