@@ -52,6 +52,11 @@ the script also accepts `-Profile core` or `-Profile ai`. No network request is
 made until the user explicitly starts the download. A failed or incomplete
 download never changes capability state to `READY`.
 
+The latest GitHub release also contains a small bootstrap ZIP with the script
+and manifest only. It does not contain the large third-party binaries/models;
+those remain upstream downloads and are installed only after checksum
+verification.
+
 ## Development
 
 ```text
