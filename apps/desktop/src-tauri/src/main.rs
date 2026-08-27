@@ -257,13 +257,17 @@ fn invalid_request() -> HostError {
     HostError::new("INVALID_REQUEST", "The request is invalid.")
 }
 
-fn default_bundle_root() -> PathBuf {
-    std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .map(|path| path.join("VideoEditorFree").join("runtime"))
-        .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))
-        .map(|path| path.join("VideoEditorFree").join("runtime"))
+fn bundle_root_from_base(base: Option<PathBuf>) -> PathBuf {
+    base.map(|path| path.join("VideoEditorFree").join("runtime"))
         .unwrap_or_else(|| PathBuf::from(".videoeditorfree").join("runtime"))
+}
+
+fn default_bundle_root() -> PathBuf {
+    bundle_root_from_base(
+        std::env::var_os("LOCALAPPDATA")
+            .or_else(|| std::env::var_os("APPDATA"))
+            .map(PathBuf::from),
+    )
 }
 
 fn media_executables_from_manifest(
@@ -272,7 +276,8 @@ fn media_executables_from_manifest(
     manifest_path: PathBuf,
 ) -> Option<ExecutableConfig> {
     let bytes = std::fs::read(manifest_path).ok()?;
-    let manifest = serde_json::from_slice::<BinaryManifest>(&bytes).ok()?;
+    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
+    let manifest = serde_json::from_slice::<BinaryManifest>(bytes).ok()?;
     let config = ExecutableConfig::new(ffmpeg, ffprobe)
         .with_binary_contract(BinaryContract::reviewed(manifest));
     config.validate().ok().map(|_| config)
@@ -314,8 +319,8 @@ fn bundle_script_path(app: &AppHandle) -> Result<PathBuf, HostError> {
         return Ok(development);
     }
     for relative in [
-        "scripts/runtime/download-bundle.ps1",
         "runtime/download-bundle.ps1",
+        "scripts/runtime/download-bundle.ps1",
         "download-bundle.ps1",
     ] {
         if let Ok(path) = app.path().resolve(relative, BaseDirectory::Resource) {
@@ -337,8 +342,8 @@ fn bundle_manifest_path(app: &AppHandle) -> Result<PathBuf, HostError> {
         return Ok(development);
     }
     for relative in [
-        "resources/runtime/bundle-manifest.json",
         "runtime/bundle-manifest.json",
+        "resources/runtime/bundle-manifest.json",
         "bundle-manifest.json",
         "scripts/runtime/bundle-manifest.json",
     ] {
@@ -372,8 +377,10 @@ fn asset_kind(path: &Path) -> Result<AssetKind, HostError> {
             HostError::new("MEDIA_UNSUPPORTED", "The asset has no supported extension.")
         })?;
     let kind = match extension.as_str() {
-        "mp4" | "mov" | "mkv" | "webm" | "avi" | "m4v" => AssetKind::Video,
-        "wav" | "mp3" | "m4a" | "flac" | "ogg" => AssetKind::Audio,
+        "mp4" | "mov" | "mkv" | "webm" | "avi" | "m4v" | "ts" | "mts" | "m2ts" | "3gp" | "flv"
+        | "wmv" | "mpeg" | "mpg" | "ogv" => AssetKind::Video,
+        "wav" | "mp3" | "m4a" | "flac" | "ogg" | "aac" | "opus" | "aiff" | "aif" | "mka"
+        | "ac3" | "wma" | "amr" => AssetKind::Audio,
         "png" | "jpg" | "jpeg" | "webp" | "bmp" => AssetKind::Image,
         "srt" | "vtt" => AssetKind::Subtitle,
         _ => {
@@ -467,6 +474,85 @@ fn stable_asset_id(relative_path: &str) -> Result<AssetId, HostError> {
     AssetId::new(format!("asset-{hash:016x}")).map_err(HostError::from)
 }
 
+fn copy_external_asset(source: &Path, root: &Path) -> Result<PathBuf, HostError> {
+    let root = root.canonicalize().map_err(|_| {
+        HostError::new(
+            "MEDIA_COPY_FAILED",
+            "The project root could not be resolved for media import.",
+        )
+    })?;
+    let file_name = source
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            HostError::new("MEDIA_PATH_INVALID", "The imported asset has no file name.")
+        })?;
+    let media_root = root.join("media");
+    std::fs::create_dir_all(&media_root).map_err(|_| {
+        HostError::new(
+            "MEDIA_COPY_FAILED",
+            "The project media directory could not be created.",
+        )
+    })?;
+    let media_root = media_root.canonicalize().map_err(|_| {
+        HostError::new(
+            "MEDIA_COPY_FAILED",
+            "The project media directory could not be resolved.",
+        )
+    })?;
+    if !media_root.starts_with(root) {
+        return Err(HostError::new(
+            "INVALID_MEDIA_PATH",
+            "The project media directory is outside the project root.",
+        ));
+    }
+    let stem = source
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("asset");
+    let extension = source
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| format!(".{value}"))
+        .unwrap_or_default();
+    let target = (0..10_000)
+        .map(|index| {
+            let candidate = if index == 0 {
+                file_name.to_owned()
+            } else {
+                format!("{stem}-{index}{extension}")
+            };
+            media_root.join(candidate)
+        })
+        .find(|candidate| !candidate.exists())
+        .ok_or_else(|| {
+            HostError::new("MEDIA_COPY_FAILED", "No safe media file name is available.")
+        })?;
+    if !target.starts_with(&media_root) {
+        return Err(HostError::new(
+            "INVALID_MEDIA_PATH",
+            "The imported asset destination is outside the project.",
+        ));
+    }
+    let temporary = target.with_file_name(format!(".{file_name}.importing"));
+    if let Err(error) = std::fs::copy(source, &temporary) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(HostError::new(
+            "MEDIA_COPY_FAILED",
+            &format!("The selected asset could not be copied into the project: {error}"),
+        ));
+    }
+    if let Err(error) = std::fs::rename(&temporary, &target) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(HostError::new(
+            "MEDIA_COPY_FAILED",
+            &format!("The copied asset could not be finalized: {error}"),
+        ));
+    }
+    Ok(target)
+}
+
 fn import_asset(host: &HostState, raw_path: &str) -> Result<Asset, HostError> {
     let input = PathBuf::from(raw_path);
     if !input.is_absolute() || !input.is_file() {
@@ -487,12 +573,11 @@ fn import_asset(host: &HostState, raw_path: &str) -> Result<Asset, HostError> {
             "The project root could not be resolved.",
         )
     })?;
-    if !input.starts_with(&root) {
-        return Err(HostError::new(
-            "INVALID_MEDIA_PATH",
-            "Imported assets must be inside the project root.",
-        ));
-    }
+    let input = if input.starts_with(&root) {
+        input
+    } else {
+        copy_external_asset(&input, &root)?
+    };
     let relative = input
         .strip_prefix(&root)
         .map_err(|_| {
@@ -789,6 +874,12 @@ fn asset_import(
         .0
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if host.project_path.is_none() {
+        return Err(HostError::new(
+            "PROJECT_PATH_REQUIRED",
+            "Create or save a project before importing media.",
+        ));
+    }
     let current = host.app.snapshot().map_err(HostError::from)?.document;
     if !host.media.is_configured() {
         return Err(HostError::unavailable(
@@ -1007,6 +1098,68 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn temporary_test_root() -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock must be valid")
+            .as_nanos();
+        std::env::temp_dir().join(format!("video-editor-import-{nonce}"))
+    }
+
+    #[test]
+    fn external_media_is_copied_into_project_media_directory() {
+        let base = temporary_test_root();
+        let project_root = base.join("project");
+        let source = base.join("outside").join("clip.mp4");
+        fs::create_dir_all(&project_root).unwrap();
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, b"real test bytes").unwrap();
+
+        let first = copy_external_asset(&source, &project_root).unwrap();
+        let second = copy_external_asset(&source, &project_root).unwrap();
+
+        assert_eq!(first.file_name().unwrap(), "clip.mp4");
+        assert_eq!(second.file_name().unwrap(), "clip-1.mp4");
+        assert_eq!(fs::read(first).unwrap(), b"real test bytes");
+        assert_eq!(fs::read(second).unwrap(), b"real test bytes");
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn bundle_root_appends_runtime_directory_once() {
+        let base = PathBuf::from(r"C:\Users\Test\AppData\Local");
+        let expected = base.join("VideoEditorFree").join("runtime");
+        let actual = bundle_root_from_base(Some(base));
+        assert_eq!(actual, expected);
+        assert!(!actual.ends_with(Path::new(
+            r"VideoEditorFree\runtime\VideoEditorFree\runtime",
+        )));
+    }
+
+    #[test]
+    fn bom_prefixed_media_manifest_is_accepted() {
+        let base = temporary_test_root();
+        let media = base.join("media");
+        fs::create_dir_all(&media).unwrap();
+        let ffmpeg = media.join("ffmpeg.exe");
+        let ffprobe = media.join("ffprobe.exe");
+        fs::write(&ffmpeg, b"ffmpeg").unwrap();
+        fs::write(&ffprobe, b"ffprobe").unwrap();
+        let manifest = base.join("media-manifest.json");
+        let json = br#"{"identity":"FFmpeg","version":"test","license":"GPL","sha256":"0000000000000000000000000000000000000000000000000000000000000000","architecture":"x86_64"}"#;
+        let mut content = vec![0xEF, 0xBB, 0xBF];
+        content.extend_from_slice(json);
+        fs::write(&manifest, content).unwrap();
+
+        assert!(media_executables_from_manifest(ffmpeg, ffprobe, manifest).is_some());
+        fs::remove_dir_all(base).unwrap();
+    }
+
     #[test]
     fn malformed_job_id_is_not_found() {
         assert_eq!(parse_job_id("nope").unwrap_err().code, "JOB_NOT_FOUND");

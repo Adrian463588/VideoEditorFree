@@ -8,7 +8,8 @@ The app's **Download bundle** button invokes
 `scripts/runtime/download-bundle.ps1`. The script only accepts HTTPS artifacts
 from `github.com` and `huggingface.co`, resumes `.part` files with `curl.exe`,
 checks the declared byte count and SHA-256, and extracts only the required
-executables. A failed checksum never becomes an installed runtime.
+runtime files (including native DLLs that an executable needs). A failed
+checksum never becomes an installed runtime.
 
 Sources selected for the Windows x64 manifest:
 

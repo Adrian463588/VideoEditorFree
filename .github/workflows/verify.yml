@@ -37,3 +37,5 @@ jobs:
         run: cargo build --locked --workspace
       - name: Frontend typecheck and build
         run: npm run build
+      - name: Tauri packaged application build
+        run: npm run tauri -- build --debug --no-bundle

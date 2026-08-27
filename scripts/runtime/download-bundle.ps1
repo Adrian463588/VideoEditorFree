@@ -29,6 +29,16 @@ function Get-Sha256([string]$Path) {
     return ($hash -replace '\s', '').ToLowerInvariant()
 }
 
+function Write-Utf8NoBom([string]$Path, [string]$Content) {
+    [IO.File]::WriteAllText($Path, $Content, [Text.UTF8Encoding]::new($false))
+}
+
+function Write-Utf8NoBomAtomic([string]$Path, [string]$Content) {
+    $temporary = "$Path.part"
+    Write-Utf8NoBom $temporary $Content
+    Move-Item -LiteralPath $temporary -Destination $Path -Force
+}
+
 function Assert-Artifact($Artifact) {
     foreach ($property in @('id', 'kind', 'destination', 'url', 'source', 'version', 'license', 'size_bytes', 'sha256')) {
         if (-not $Artifact.PSObject.Properties.Name.Contains($property) -or [string]::IsNullOrWhiteSpace([string]$Artifact.$property)) {
@@ -66,6 +76,20 @@ function Download-Artifact($Artifact) {
             return $target
         }
         Remove-Item -LiteralPath $target -Force
+    }
+
+    if (Test-Path -LiteralPath $part) {
+        $partial = Get-Item -LiteralPath $part
+        if ([int64]$partial.Length -eq [int64]$Artifact.size_bytes) {
+            if ((Get-Sha256 $part) -eq ([string]$Artifact.sha256).ToLowerInvariant()) {
+                Move-Item -LiteralPath $part -Destination $target -Force
+                Write-Host "verified $($Artifact.id) from complete partial download"
+                return $target
+            }
+            Remove-Item -LiteralPath $part -Force
+        } elseif ([int64]$partial.Length -gt [int64]$Artifact.size_bytes) {
+            Remove-Item -LiteralPath $part -Force
+        }
     }
 
     Write-Host "download $($Artifact.id)"
@@ -189,12 +213,12 @@ if ($ffmpeg) {
         sha256 = $ffmpeg.sha256
         architecture = 'x86_64'
     }
-    $mediaManifest | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $InstallRoot 'media-manifest.json') -Encoding UTF8
+    Write-Utf8NoBomAtomic (Join-Path $InstallRoot 'media-manifest.json') ($mediaManifest | ConvertTo-Json)
 }
 
 $llama = $selected | Where-Object id -eq 'llama-cpp-windows-x64-cpu'
 if ($llama) {
-    Expand-RequiredFiles $downloaded[$llama.id] (Join-Path $InstallRoot 'ai\llama') @('llama-cli.exe')
+    Expand-ArchiveTree $downloaded[$llama.id] (Join-Path $InstallRoot 'ai\llama') 'llama-cli.exe'
 }
 
 $piper = $selected | Where-Object id -eq 'piper-windows-x64-runtime'
@@ -210,5 +234,5 @@ $state = [ordered]@{
     verified_artifacts = @($selected | ForEach-Object { $_.id })
     generated_at_utc = [DateTime]::UtcNow.ToString('o')
 }
-$state | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $InstallRoot 'bundle-state.json') -Encoding UTF8
+Write-Utf8NoBomAtomic (Join-Path $InstallRoot 'bundle-state.json') ($state | ConvertTo-Json -Depth 5)
 Write-Output "bundle ready: $InstallRoot"

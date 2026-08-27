@@ -38,8 +38,9 @@ allowlisted Windows x64 artifacts to
 `%LOCALAPPDATA%\VideoEditorFree\runtime`, resumes `.part` files, verifies the
 declared size and SHA-256, then extracts only the required runtime files.
 
-In the desktop app, choose **Download bundle**. From a Windows development
-checkout, the equivalent command is:
+In the desktop app, choose **Download bundle** to provision the `core` media
+profile (FFmpeg/ffprobe) required for import, preview, and export. From a
+Windows development checkout, the equivalent command is:
 
 ```powershell
 npm install
@@ -47,8 +48,9 @@ npm run verify:bundle
 npm run bundle:download
 ```
 
-The `all` profile includes the media runtime plus optional local AI artifacts;
-the script also accepts `-Profile core` or `-Profile ai`. No network request is
+The script defaults to the `all` profile for explicit CLI provisioning and also
+accepts `-Profile core` or `-Profile ai`. Use `npm run bundle:download --
+-Profile core` for the same profile as the desktop button. No network request is
 made until the user explicitly starts the download. A failed or incomplete
 download never changes capability state to `READY`.
 

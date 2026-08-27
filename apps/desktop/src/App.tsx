@@ -102,7 +102,7 @@ export function App() {
   const downloadBundle = async () => {
     setBundleBusy(true);
     try {
-      await dispatch({ type: "bundleDownload", profile: "all" });
+      await dispatch({ type: "bundleDownload", profile: "core" });
     } finally {
       setBundleBusy(false);
     }

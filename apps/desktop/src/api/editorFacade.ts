@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import type { EditorSnapshot, HostStatus, JobRecord, ProjectDocument } from "../types/editor";
 import { emptyEditorSnapshot } from "../types/editor";
 
@@ -69,9 +69,15 @@ interface CommandSpec {
 
 /** Single typed IPC boundary. Components only depend on EditorFacade. */
 type CommandTransport = <K extends keyof CommandSpec>(command: K, args: CommandSpec[K]["args"]) => Promise<CommandSpec[K]["result"]>;
-const tauriTransport: CommandTransport = <K extends keyof CommandSpec>(command: K, args: CommandSpec[K]["args"]) => invoke<CommandSpec[K]["result"]>(command, args as Record<string, unknown> | undefined);
+const tauriTransport: CommandTransport = <K extends keyof CommandSpec>(command: K, args: CommandSpec[K]["args"]) => {
+  const payload = args === undefined ? undefined : { request: args };
+  return invoke<CommandSpec[K]["result"]>(command, payload as Record<string, unknown> | undefined);
+};
 const isTauriRuntime = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 const unavailableMessage = "UNAVAILABLE — Tauri host is not running. No project, media, transcript, model, or export was created.";
+const projectFilters = [{ name: "VideoEditorFree project", extensions: ["vdeproj"] }];
+const mediaFilters = [{ name: "Media", extensions: ["mp4", "mov", "mkv", "webm", "avi", "m4v", "ts", "mts", "m2ts", "3gp", "flv", "wmv", "mpeg", "mpg", "ogv", "wav", "mp3", "m4a", "flac", "ogg", "aac", "opus", "aiff", "aif", "mka", "ac3", "wma", "amr", "png", "jpg", "jpeg", "webp", "bmp", "srt", "vtt"] }];
+const projectPathWithExtension = (path: string) => path.toLowerCase().endsWith(".vdeproj") ? path : `${path}.vdeproj`;
 
 const statusSnapshot = (status: HostStatus, project: ProjectDocument | null = null, jobs: JobRecord[] = []): EditorSnapshot => ({
   ...emptyEditorSnapshot,
@@ -114,14 +120,20 @@ const transportErrorCode = (error: unknown) => {
 };
 
 const isMissingHostCommand = (error: unknown) => /(?:command|invoke).*(?:not found|unknown|unavailable|not allowed)/i.test(transportErrorMessage(error));
-  const isUnavailableHostError = (error: unknown) => /(?:UNAVAILABLE|NOT_PROVISIONED|BUNDLE_DOWNLOAD_FAILED|BUNDLE_SCRIPT_MISSING|BUNDLE_MANIFEST_MISSING)/i.test(transportErrorCode(error))
-  || /(?:not provisioned|no reviewed .* provisioned|runtime is unavailable)/i.test(transportErrorMessage(error));
+const isUnavailableHostError = (error: unknown) => /(?:UNAVAILABLE|NOT_PROVISIONED|MEDIA_UNAVAILABLE|PREVIEW_UNAVAILABLE|AI_UNAVAILABLE|BUNDLE_DOWNLOAD_FAILED|BUNDLE_SCRIPT_MISSING|BUNDLE_MANIFEST_MISSING)/i.test(transportErrorCode(error))
+  || /(?:not provisioned|no (?:reviewed|verified) .* provisioned|runtime is unavailable)/i.test(transportErrorMessage(error));
 
 const createTauriEditorFacade = (transport: CommandTransport): EditorFacade => {
   let snapshot = emptyEditorSnapshot;
+  let projectPath: string | null = null;
   const listeners = new Set<(event: EditorEvent) => void>();
   const notify = (event: EditorEvent) => listeners.forEach((listener) => listener(event));
-  const setProject = (project: ProjectDocument, message: string) => {
+  const chooseProjectPath = async (title: string) => {
+    const selected = await save({ title, defaultPath: "Untitled.vdeproj", filters: projectFilters });
+    return typeof selected === "string" && selected.trim() ? projectPathWithExtension(selected.trim()) : null;
+  };
+  const setProject = (project: ProjectDocument, message: string, path?: string) => {
+    if (path) projectPath = path;
     snapshot = { ...snapshot, project, connection: "READY", connectionMessage: message };
     notify({ type: "snapshotUpdated", snapshot });
   };
@@ -146,8 +158,10 @@ const createTauriEditorFacade = (transport: CommandTransport): EditorFacade => {
             return { status: "accepted", message: `${result.message} Install root: ${result.installRoot}`, snapshot };
           }
           case "projectCreate": {
-            const project = await transport("project_create", { name: command.name });
-            setProject(project, `Project created: ${project.name}.`);
+            const selectedPath = await chooseProjectPath("Create VideoEditorFree project");
+            if (!selectedPath) return { status: "accepted", message: "Project creation cancelled." };
+            const project = await transport("project_create", { name: command.name, projectPath: selectedPath });
+            setProject(project, `Project created: ${project.name}.`, selectedPath);
             return { status: "accepted", message: snapshot.connectionMessage, snapshot };
           }
           case "projectOpenRequested": {
@@ -161,26 +175,38 @@ const createTauriEditorFacade = (transport: CommandTransport): EditorFacade => {
               return { status: "accepted", message: "No project selected." };
             }
             const project = await transport("project_open", { projectPath: selectedPath });
-            setProject(project, `Project opened: ${project.name}.`);
+            setProject(project, `Project opened: ${project.name}.`, selectedPath);
             return { status: "accepted", message: snapshot.connectionMessage, snapshot };
           }
           case "projectSave": {
-            const result = await transport("project_save", {});
+            const selectedPath = projectPath ?? await chooseProjectPath("Save VideoEditorFree project");
+            if (!selectedPath) return { status: "accepted", message: "Save cancelled." };
+            const result = await transport("project_save", { projectPath: selectedPath });
+            projectPath = selectedPath;
             const message = `Project saved: ${result.bytesWritten} bytes${result.backupCreated ? "; backup created." : "."}`;
             snapshot = { ...snapshot, connectionMessage: message };
             notify({ type: "snapshotUpdated", snapshot });
             return { status: "accepted", message, snapshot };
           }
           case "assetImportRequested": {
+            if (snapshot.capabilities.mediaRuntime !== "READY") {
+              return { status: "UNAVAILABLE", message: "UNAVAILABLE — download and verify the Core bundle before importing media." };
+            }
             const selected = await open({
               title: "Import media",
               multiple: true,
               directory: false,
-              filters: [{ name: "Media", extensions: ["mp4", "mov", "mkv", "webm", "avi", "m4v", "wav", "mp3", "m4a", "flac", "ogg", "png", "jpg", "jpeg", "webp", "bmp", "srt", "vtt"] }],
+              filters: mediaFilters,
             });
             const paths = selected === null ? [] : Array.isArray(selected) ? selected : [selected];
             if (paths.length === 0) {
               return { status: "accepted", message: "No media selected." };
+            }
+            if (!snapshot.project) {
+              const selectedPath = await chooseProjectPath("Choose project location before importing media");
+              if (!selectedPath) return { status: "accepted", message: "Import cancelled; no project was created." };
+              const project = await transport("project_create", { name: "Untitled project", projectPath: selectedPath });
+              setProject(project, `Project created: ${project.name}.`, selectedPath);
             }
             const project = await transport("asset_import", { paths });
             setProject(project, "Assets imported.");

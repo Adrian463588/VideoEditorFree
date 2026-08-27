@@ -26,10 +26,10 @@
   },
   "bundle": {
     "active": true,
-    "resources": [
-      "../../../resources/runtime/*",
-      "../../../scripts/runtime/*"
-    ],
+    "resources": {
+      "../../../resources/runtime/bundle-manifest.json": "runtime/bundle-manifest.json",
+      "../../../scripts/runtime/download-bundle.ps1": "runtime/download-bundle.ps1"
+    },
     "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.ico"]
   }
 }
